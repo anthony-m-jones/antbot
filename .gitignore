@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# Runtime / generated — per-world state and captures, not source.
+# (Comments must be on their own line; trailing comments are treated as pattern text.)
+recordings/
+antbot/learned_hazards.json
+antbot/learned_objects.json
+
+# Local editor / OS cruft
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
