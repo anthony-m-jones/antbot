@@ -1,0 +1,1530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>antbot — swarm control</title>
+<!--
+================================================================================
+  antbot — swarm control & observability dashboard   (design mockup)
+================================================================================
+  A single self-contained file: inline CSS + JS, no frameworks, no CDNs, no web
+  fonts, no network. Renders normal view, Path Inspector, Replay, plus the
+  first-run empty state, live/disconnected, follow, and command-in-flight states.
+  All rendering is driven by a single mock STATE object shaped exactly like
+  /state.json (plus MOCK_RECORDINGS / a mock recording for Replay). Swap the
+  "poll" tick for a real fetch('/state.json') and nothing in the layout changes.
+
+  --------------------------------------------------------------------------
+  DESIGN NOTES
+  --------------------------------------------------------------------------
+  DIRECTION — "scientific instrument". Near-black canvas, hairline grids, a
+  single cool phosphor accent (oscilloscope/sonar). Calm and information-dense;
+  color is reserved for meaning (bot identity, HP, severity), never decoration.
+
+  LAYOUT / GRID
+    Row 1  Top status bar (fixed 52px): identity + telemetry (left), mode
+           segmented control (center), connection + clock (right).
+    Row 2  Three columns:  [ Bots rail 312px | Map stage 1fr | Events dock 340px ]
+           The map is the centerpiece and always the widest column. Rails scroll
+           internally; the map never scrolls. A mode toolbar docks under the map
+           and changes per mode (start controls / path report / replay scrubber).
+
+  COLOR SYSTEM
+    Surfaces  bg #0b0c0e · panel #101216 · raised #16191f · hairlines are cool
+              white at 8–18% alpha (never solid borders).
+    Text      #c8cfd7 primary · #828b97 dim · #565e68 faint. Cool gray ramp.
+    Accent    phosphor teal #35e0c5 — selection, focus, live, active mode, the
+              followed bot's ring. Exactly one accent by design.
+    HP        green #4bd06a (>60%) · amber #e6b23e (25–60%) · red #ef4d52 (<25%).
+    Severity  info=accent · warning=amber · error=red (events + connection).
+    Bots      12-hue palette at even chroma/lightness, assigned stably by a name
+              hash so a bot keeps its color across polls/sessions.
+    Minimap   muted terrain ramp: grass/path/stone/sand/water/wall, low-sat so
+              thousands of tiles read as texture, not noise. Creatures = red.
+
+  TYPOGRAPHY (system stacks only — offline safe)
+    UI/labels  system-ui / Helvetica Neue / Arial.
+    Data       ui-monospace / SF Mono / Menlo / Consolas — all numbers, coords,
+               ids, statuses, times. Tabular figures so live updates don't jitter.
+
+  COMPONENT INVENTORY
+    Top bar · mode segmented control · connection pill · bots rail (search,
+    role/status filter chips, status-count summary, density toggle, scale-demo,
+    bot rows w/ color dot + HP bar + status, expanded followed-bot detail) ·
+    events dock (severity filter, log rows w/ ago/bot/msg/pos) · map canvas ·
+    start controls · first-run empty overlay · path report · replay scrubber +
+    timeline log + readout · toasts for command feedback.
+
+  STATES DESIGNED
+    first-run empty (default on load) · launching/in-flight · live · disconnected
+    (dim + reconnect overlay; click the pill to toggle) · bot followed vs not ·
+    three modes and the switch between them · scale demo (8 / 160 / 900 bots)
+    to prove the rail + markers degrade gracefully (grouping, density, counts).
+
+  INTERACTION RATIONALE
+    Bots do NOT auto-start, so load = empty map + one obvious CTA. Modes are a
+    top-bar segmented control (instant, in place — no navigation). Following a
+    bot is a single click; the map centers + rings it and the row expands.
+    At scale the list collapses to per-status group headers with counts and the
+    map switches to density dots — same layout, no redesign. Every panel is
+    independently scrollable; the map is fixed so live motion is always visible.
+
+  SCALE / FUTURE (left room for): whole-swarm replay (timeline is bot-agnostic),
+  role grouping already in the rail (hauler/supplier/hunter slot in), analytics/
+  heatmap toggle stub on the map, side-by-side diff (two stages fit the grid),
+  per-bot inventory (expands the detail card), creatures on live map (renderer
+  already draws them in replay). Long lists → virtualize the rows (noted).
+================================================================================
+-->
+<style>
+  :root{
+    --bg:#0b0c0e; --panel:#101216; --raised:#16191f; --raised-2:#1c2027;
+    --line:rgba(150,170,190,.09); --line-2:rgba(150,170,190,.16); --line-3:rgba(150,170,190,.26);
+    --tx:#c8cfd7; --tx-dim:#828b97; --tx-faint:#565e68;
+    --accent:#35e0c5; --accent-deep:#1b8f80; --accent-glow:rgba(53,224,197,.22);
+    --green:#4bd06a; --amber:#e6b23e; --red:#ef4d52;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+    --r:5px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--tx);
+    font-family:var(--sans); font-size:13px; line-height:1.4;
+    -webkit-font-smoothing:antialiased; overflow:hidden;
+    font-variant-numeric:tabular-nums;
+  }
+  .mono{font-family:var(--mono)}
+  .dim{color:var(--tx-dim)} .faint{color:var(--tx-faint)}
+  button{font-family:inherit;color:inherit;cursor:pointer}
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:9px;border:2px solid var(--bg)}
+  ::-webkit-scrollbar-track{background:transparent}
+
+  .app{display:grid;grid-template-rows:52px 1fr;height:100vh}
+
+  /* ---------- top bar ---------- */
+  .topbar{
+    display:grid;grid-template-columns:1fr auto 1fr;align-items:center;
+    padding:0 14px;border-bottom:1px solid var(--line-2);
+    background:linear-gradient(#101216,#0d0f12);
+  }
+  .brand{display:flex;align-items:center;gap:10px}
+  .brand .glyph{width:22px;height:22px;position:relative}
+  .brand .glyph svg{display:block}
+  .brand h1{font-size:14px;letter-spacing:.16em;text-transform:uppercase;margin:0;font-weight:600}
+  .brand h1 b{color:var(--accent);font-weight:600}
+  .brand .tag{font:11px/1 var(--mono);color:var(--tx-faint);border:1px solid var(--line-2);padding:3px 6px;border-radius:4px}
+
+  .telemetry{display:flex;gap:2px;align-items:center;margin-left:14px}
+  .tele{display:flex;flex-direction:column;padding:0 12px;border-left:1px solid var(--line);min-width:0}
+  .tele:first-child{border-left:0}
+  .tele .k{font-size:9px;letter-spacing:.13em;text-transform:uppercase;color:var(--tx-faint)}
+  .tele .v{font:600 14px/1.2 var(--mono);color:var(--tx);white-space:nowrap}
+  .tele .v.accent{color:var(--accent)}
+  .tele .v small{font-size:10px;color:var(--tx-dim);font-weight:400}
+  .tele .flr{display:flex;align-items:center;gap:5px}
+  .flrbtn{background:var(--raised);border:1px solid var(--line-2);border-radius:4px;width:18px;height:18px;line-height:1;
+    display:flex;align-items:center;justify-content:center;color:var(--tx-dim);font-size:12px;padding:0}
+  .flrbtn:hover{color:var(--accent);border-color:var(--accent-deep)}
+
+  .modes{display:flex;background:var(--bg);border:1px solid var(--line-2);border-radius:7px;padding:3px;gap:2px}
+  .modes button{
+    border:0;background:transparent;color:var(--tx-dim);border-radius:5px;
+    padding:6px 15px;font-size:12px;font-weight:500;letter-spacing:.02em;
+    display:flex;align-items:center;gap:7px;transition:color .12s,background .12s;
+  }
+  .modes button .ic{width:13px;height:13px;opacity:.8}
+  .modes button:hover{color:var(--tx)}
+  .modes button.on{background:var(--raised-2);color:var(--accent);box-shadow:0 0 0 1px var(--accent-deep) inset}
+  .modes button.on .ic{opacity:1}
+
+  .rightbar{display:flex;align-items:center;justify-content:flex-end;gap:12px}
+  .clock{font:12px/1 var(--mono);color:var(--tx-dim)}
+  .conn{
+    display:flex;align-items:center;gap:7px;padding:6px 11px;border-radius:6px;cursor:pointer;
+    border:1px solid var(--line-2);background:var(--raised);font:600 11px/1 var(--mono);letter-spacing:.1em;
+  }
+  .conn .led{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(75,208,106,.5)}
+  .conn.live .led{animation:beat 1.6s infinite}
+  .conn.live{color:var(--green)}
+  .conn.down{color:var(--red);border-color:rgba(239,77,82,.4)}
+  .conn.down .led{background:var(--red);animation:none}
+  @keyframes beat{0%{box-shadow:0 0 0 0 rgba(75,208,106,.45)}70%{box-shadow:0 0 0 6px rgba(75,208,106,0)}100%{box-shadow:0 0 0 0 rgba(75,208,106,0)}}
+
+  /* ---------- main grid ---------- */
+  .main{display:grid;grid-template-columns:312px 1fr 340px;min-height:0}
+  .rail{background:var(--panel);display:flex;flex-direction:column;min-height:0}
+  .rail.left{border-right:1px solid var(--line-2)}
+  .rail.right{border-left:1px solid var(--line-2)}
+  .rail h2{
+    margin:0;padding:11px 13px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--tx-dim);
+    display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);font-weight:600;
+  }
+  .rail h2 .count{font:600 11px/1 var(--mono);color:var(--tx-faint)}
+  .rail-body{overflow-y:auto;flex:1;min-height:0}
+
+  /* ---------- bots panel ---------- */
+  .bots-tools{padding:9px 11px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:8px}
+  .search{position:relative}
+  .search input{
+    width:100%;background:var(--bg);border:1px solid var(--line-2);border-radius:5px;color:var(--tx);
+    font:12px/1 var(--mono);padding:7px 9px 7px 27px;outline:none;
+  }
+  .search input:focus{border-color:var(--accent-deep);box-shadow:0 0 0 2px var(--accent-glow)}
+  .search svg{position:absolute;left:8px;top:50%;transform:translateY(-50%);opacity:.5}
+  .chips{display:flex;flex-wrap:wrap;gap:5px}
+  .chip{
+    font:600 10px/1 var(--mono);letter-spacing:.04em;padding:5px 8px;border-radius:20px;
+    background:var(--raised);border:1px solid var(--line-2);color:var(--tx-dim);display:flex;align-items:center;gap:5px;
+  }
+  .chip .n{color:var(--tx);font-weight:700}
+  .chip:hover{border-color:var(--line-3);color:var(--tx)}
+  .chip.on{background:var(--accent-glow);border-color:var(--accent-deep);color:var(--accent)}
+  .chip .swatch{width:7px;height:7px;border-radius:2px}
+  .row-tools{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .seg{display:flex;border:1px solid var(--line-2);border-radius:5px;overflow:hidden}
+  .seg button{border:0;background:transparent;color:var(--tx-faint);padding:4px 8px;font:600 10px/1 var(--mono);letter-spacing:.05em}
+  .seg button.on{background:var(--raised-2);color:var(--accent)}
+  .mini{font:10px/1 var(--mono);color:var(--tx-faint)}
+  .mini b{color:var(--accent);cursor:pointer}
+  .mini b:hover{text-decoration:underline}
+
+  .grouphdr{
+    display:flex;align-items:center;gap:8px;padding:6px 13px;background:var(--bg);
+    position:sticky;top:0;font:600 10px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--tx-dim);
+    border-bottom:1px solid var(--line);z-index:1;
+  }
+  .grouphdr .gc{margin-left:auto;color:var(--tx-faint)}
+
+  .bot{
+    display:grid;grid-template-columns:14px 1fr auto;gap:9px;align-items:center;
+    padding:9px 13px;border-bottom:1px solid var(--line);cursor:pointer;position:relative;
+  }
+  .bot:hover{background:var(--raised)}
+  .bot.sel{background:linear-gradient(90deg,var(--accent-glow),transparent 70%)}
+  .bot.sel::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent)}
+  .bot .dot{width:11px;height:11px;border-radius:50%;box-shadow:0 0 0 2px rgba(0,0,0,.4)}
+  .bot .idn{min-width:0}
+  .bot .nm{font:600 12px/1.2 var(--sans);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bot .st{font:11px/1.2 var(--mono);color:var(--tx-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+  .bot .st .lvl{color:var(--tx-faint)}
+  .hpwrap{display:flex;flex-direction:column;align-items:flex-end;gap:4px;width:66px}
+  .hpbar{width:100%;height:5px;border-radius:3px;background:var(--raised-2);overflow:hidden}
+  .hpbar i{display:block;height:100%;border-radius:3px}
+  .hp-n{font:10px/1 var(--mono);color:var(--tx-faint)}
+  .bot.compact{padding:5px 13px}
+  .bot.compact .st{display:none}
+  .bot.compact .hpwrap .hp-n{display:none}
+
+  /* dense (scale) view */
+  .dense-grid{padding:10px 12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(13px,1fr));gap:5px}
+  .dense-grid .d{width:11px;height:11px;border-radius:2px;position:relative}
+  .dense-note{padding:10px 13px;color:var(--tx-faint);font:11px/1.5 var(--mono);border-bottom:1px solid var(--line)}
+
+  /* followed bot detail */
+  .detail{border-top:1px solid var(--line-2);background:var(--raised);padding:12px 13px}
+  .detail .dh{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+  .detail .dh .dot{width:12px;height:12px;border-radius:50%}
+  .detail .dh .nm{font:600 13px/1 var(--sans)}
+  .detail .dh .ch{font:11px/1 var(--mono);color:var(--tx-dim);margin-left:auto}
+  .detstats{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
+  .dstat .k{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--tx-faint)}
+  .dstat .v{font:600 13px/1.3 var(--mono)}
+  .bar2{height:6px;border-radius:3px;background:var(--raised-2);overflow:hidden;margin-top:3px}
+  .bar2 i{display:block;height:100%}
+  .detail .full{grid-column:1/3}
+
+  /* ---------- events panel ---------- */
+  .ev-tools{display:flex;gap:5px;padding:8px 11px;border-bottom:1px solid var(--line)}
+  .ev-tools .chip{cursor:pointer}
+  .event{display:grid;grid-template-columns:8px 1fr;gap:9px;padding:9px 13px;border-bottom:1px solid var(--line);cursor:pointer}
+  .event:hover{background:var(--raised)}
+  .event .sev{width:8px;border-radius:2px;margin-top:2px}
+  .event .top{display:flex;align-items:baseline;gap:7px}
+  .event .cat{font:600 10px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase}
+  .event .ago{font:10px/1 var(--mono);color:var(--tx-faint);margin-left:auto;white-space:nowrap}
+  .event .msg{font:12px/1.4 var(--sans);color:var(--tx);margin-top:3px;text-wrap:pretty}
+  .event .meta{font:10px/1 var(--mono);color:var(--tx-faint);margin-top:4px;display:flex;gap:10px}
+  .event .meta b{color:var(--tx-dim);font-weight:600}
+
+  /* ---------- map stage ---------- */
+  .stage{position:relative;display:flex;flex-direction:column;min-width:0;background:#08090b}
+  .canvas-wrap{position:relative;flex:1;min-height:0;overflow:hidden}
+  #map{display:block;width:100%;height:100%;position:absolute;inset:0}
+  .grid-fade{position:absolute;inset:0;pointer-events:none;
+    background:
+      linear-gradient(90deg,transparent 0,rgba(0,0,0,0) 60%,rgba(0,0,0,.35) 100%),
+      radial-gradient(120% 120% at 50% 40%,transparent 55%,rgba(0,0,0,.5) 100%);}
+  .map-hud{position:absolute;left:12px;top:12px;display:flex;gap:8px;pointer-events:none}
+  .hud-pill{background:rgba(11,12,14,.72);backdrop-filter:blur(3px);border:1px solid var(--line-2);border-radius:5px;
+    padding:6px 10px;font:11px/1 var(--mono);color:var(--tx-dim);display:flex;align-items:center;gap:8px}
+  .hud-pill b{color:var(--accent);font-weight:600}
+  .map-tools{position:absolute;right:12px;top:12px;display:flex;flex-direction:column;gap:6px;pointer-events:auto}
+  .mtool{width:32px;height:32px;background:rgba(11,12,14,.75);border:1px solid var(--line-2);border-radius:6px;
+    color:var(--tx-dim);display:flex;align-items:center;justify-content:center;font-size:15px}
+  .mtool:hover{color:var(--accent);border-color:var(--accent-deep)}
+  .mtool.on{color:var(--accent);border-color:var(--accent-deep);background:var(--accent-glow)}
+  .scalebar{position:absolute;left:12px;bottom:12px;pointer-events:none;font:10px/1 var(--mono);color:var(--tx-dim);
+    display:flex;flex-direction:column;gap:3px}
+  .block-legend{position:absolute;right:12px;top:52px;background:rgba(12,14,17,.86);border:1px solid var(--line-3);
+    border-radius:8px;padding:8px 10px;font:11px/1.5 var(--mono);color:var(--tx);pointer-events:none;z-index:5;max-width:230px}
+  .block-legend .blrow{display:flex;align-items:center;gap:6px;white-space:nowrap}
+  .block-legend .blrow b{margin-left:auto;color:var(--tx)}
+  .block-legend .blsw{width:10px;height:10px;border-radius:2px;flex:none;border:1px solid rgba(0,0,0,.5)}
+  .scalebar .ln{height:5px;border-left:1px solid var(--line-3);border-right:1px solid var(--line-3);border-bottom:1px solid var(--line-3)}
+
+  /* disconnected overlay */
+  .down-veil{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;
+    background:rgba(8,9,11,.66);backdrop-filter:blur(1px);z-index:5}
+  body.disconnected .down-veil{display:flex}
+  body.disconnected #map{filter:grayscale(.6) brightness(.6)}
+  .down-veil .spin{width:34px;height:34px;border:2px solid var(--line-2);border-top-color:var(--red);border-radius:50%;animation:spin 1s linear infinite}
+  .down-veil .t{font:600 13px/1 var(--mono);letter-spacing:.1em;color:var(--red);text-transform:uppercase}
+  .down-veil .s{font:11px/1 var(--mono);color:var(--tx-dim)}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* first-run empty overlay */
+  .empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:4}
+  .empty-card{
+    width:420px;background:linear-gradient(180deg,#14171d,#0e1013);border:1px solid var(--line-2);border-radius:12px;
+    padding:26px 26px 22px;box-shadow:0 30px 80px rgba(0,0,0,.55);text-align:center;
+  }
+  .empty-card .mark{width:46px;height:46px;margin:0 auto 14px;opacity:.9}
+  .empty-card h3{margin:0 0 6px;font-size:17px;font-weight:600;letter-spacing:.01em}
+  .empty-card p{margin:0 0 20px;color:var(--tx-dim);font-size:12.5px;line-height:1.55;text-wrap:pretty}
+  .launch{display:flex;gap:14px;justify-content:center;margin-bottom:18px}
+  .numfield{display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+  .numfield label{font:9px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--tx-faint)}
+  .stepper{display:flex;align-items:center;background:var(--bg);border:1px solid var(--line-2);border-radius:6px;overflow:hidden}
+  .stepper button{border:0;background:transparent;width:30px;height:34px;color:var(--tx-dim);font-size:16px}
+  .stepper button:hover{color:var(--accent);background:var(--raised)}
+  .stepper input{width:44px;height:34px;border:0;background:transparent;text-align:center;color:var(--tx);font:600 15px/1 var(--mono);outline:none;border-left:1px solid var(--line);border-right:1px solid var(--line)}
+  .btn{border:1px solid var(--line-2);background:var(--raised);border-radius:7px;padding:10px 18px;font:600 12px/1 var(--sans);
+    letter-spacing:.03em;color:var(--tx);display:inline-flex;align-items:center;gap:8px;transition:.12s}
+  .btn:hover{border-color:var(--line-3)}
+  .btn.primary{background:var(--accent);color:#04211d;border-color:var(--accent);box-shadow:0 0 24px var(--accent-glow)}
+  .btn.primary:hover{filter:brightness(1.06)}
+  .btn.danger{color:var(--red);border-color:rgba(239,77,82,.3)}
+  .btn.danger:hover{background:rgba(239,77,82,.1)}
+  .btn:disabled{opacity:.5;cursor:default}
+  .btn .sp{width:13px;height:13px;border:2px solid rgba(4,33,29,.35);border-top-color:#04211d;border-radius:50%;animation:spin .7s linear infinite}
+  .btn.ghost .sp{border-color:var(--line-2);border-top-color:var(--accent)}
+  .empty-card .pool{font:10px/1 var(--mono);color:var(--tx-faint)}
+  .empty-card .pool b{color:var(--tx-dim)}
+
+  /* ---------- mode dock (under map) ---------- */
+  .dock{border-top:1px solid var(--line-2);background:var(--panel);min-height:56px;display:flex;align-items:center}
+  .dock-pane{display:none;width:100%;align-items:center;gap:16px;padding:10px 14px}
+  .dock-pane.on{display:flex}
+  .dock-label{font:9px/1.2 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--tx-faint);white-space:nowrap}
+  .dock-group{display:flex;align-items:center;gap:9px}
+  .dock-sep{width:1px;height:30px;background:var(--line-2)}
+  .field-inline{display:flex;align-items:center;gap:8px}
+  .field-inline .stepper{border-radius:5px}
+  .field-inline .stepper button{height:30px;width:26px;font-size:14px}
+  .field-inline .stepper input{height:30px;width:38px;font-size:13px}
+
+  /* normal-mode running controls */
+  .run-status{display:flex;align-items:center;gap:8px;font:11px/1 var(--mono);color:var(--tx-dim)}
+  .run-status .led{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+
+  /* path report */
+  .path-report{display:flex;gap:0;margin-left:auto}
+  .path-report .cell{padding:0 15px;border-left:1px solid var(--line);text-align:right}
+  .path-report .cell .k{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--tx-faint)}
+  .path-report .cell .v{font:600 15px/1.2 var(--mono);color:var(--tx)}
+  .path-report .cell .v.accent{color:var(--accent)}
+  .path-hint{font:11px/1.5 var(--mono);color:var(--tx-dim)}
+  .pin-tag{display:inline-flex;align-items:center;gap:6px;font:11px/1 var(--mono)}
+  .pin-tag .p{width:11px;height:11px;border-radius:50% 50% 50% 0;transform:rotate(-45deg)}
+
+  /* replay scrubber */
+  .replay-dock{flex-direction:column !important;align-items:stretch !important;gap:8px !important;padding:9px 14px !important}
+  .replay-top{display:flex;align-items:center;gap:12px}
+  .transport{display:flex;align-items:center;gap:6px}
+  .tbtn{width:32px;height:32px;border:1px solid var(--line-2);background:var(--raised);border-radius:6px;color:var(--tx);
+    display:flex;align-items:center;justify-content:center;font-size:13px}
+  .tbtn:hover{border-color:var(--accent-deep);color:var(--accent)}
+  .tbtn.play{background:var(--accent);color:#04211d;border-color:var(--accent);width:36px;height:36px}
+  .rec-select{background:var(--bg);border:1px solid var(--line-2);border-radius:6px;color:var(--tx);font:12px/1 var(--mono);padding:8px 10px;outline:none}
+  .rec-select:focus{border-color:var(--accent-deep)}
+  .speed{display:flex;border:1px solid var(--line-2);border-radius:6px;overflow:hidden}
+  .speed button{border:0;background:transparent;color:var(--tx-faint);padding:6px 9px;font:600 11px/1 var(--mono)}
+  .speed button.on{background:var(--raised-2);color:var(--accent)}
+  .time{font:12px/1 var(--mono);color:var(--tx-dim);white-space:nowrap}
+  .time b{color:var(--tx)}
+  .seek{flex:1;position:relative;height:26px;display:flex;align-items:center}
+  .seek input[type=range]{-webkit-appearance:none;width:100%;height:5px;border-radius:3px;background:var(--raised-2);outline:none}
+  .seek input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-glow),0 0 10px var(--accent-glow);cursor:pointer}
+  .seek .mk{position:absolute;top:50%;transform:translate(-50%,-50%);width:3px;height:11px;border-radius:2px;pointer-events:none}
+  .seek .fill{position:absolute;left:0;height:5px;border-radius:3px;background:linear-gradient(90deg,var(--accent-deep),var(--accent));pointer-events:none}
+
+  /* replay side readout (in right rail) + timeline log */
+  .readout{padding:12px 13px;border-bottom:1px solid var(--line-2);background:var(--raised)}
+  .readout .rh{font:9px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--tx-faint);margin-bottom:10px}
+  .tl-row{display:grid;grid-template-columns:52px 1fr;gap:9px;padding:8px 13px;border-bottom:1px solid var(--line);cursor:pointer;position:relative}
+  .tl-row:hover{background:var(--raised)}
+  .tl-row.past{opacity:.5}
+  .tl-row.now{background:var(--accent-glow)}
+  .tl-row.now::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent)}
+  .tl-t{font:11px/1.4 var(--mono);color:var(--tx-faint);text-align:right}
+  .tl-body .ty{font:600 9px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;padding:2px 5px;border-radius:3px;display:inline-block;margin-bottom:4px}
+  .tl-body .tx{font:12px/1.35 var(--sans);color:var(--tx);text-wrap:pretty}
+
+  /* toasts */
+  .toasts{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;gap:8px;z-index:50;align-items:center}
+  .toast{background:var(--raised-2);border:1px solid var(--line-2);border-radius:8px;padding:10px 16px;font:12px/1 var(--mono);
+    display:flex;align-items:center;gap:10px;box-shadow:0 12px 40px rgba(0,0,0,.5);animation:toast .25s ease}
+  .toast .led{width:8px;height:8px;border-radius:50%}
+  .toast.ok{color:var(--accent)} .toast.ok .led{background:var(--accent)}
+  .toast.warn{color:var(--amber)} .toast.warn .led{background:var(--amber)}
+  @keyframes toast{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+  .hidden{display:none !important}
+  .kbd{font:10px/1 var(--mono);border:1px solid var(--line-2);border-bottom-width:2px;border-radius:4px;padding:2px 5px;color:var(--tx-dim)}
+</style>
+</head>
+<body class="empty-run">
+<div class="app">
+
+  <!-- ======================= TOP BAR ======================= -->
+  <header class="topbar">
+    <div style="display:flex;align-items:center">
+      <div class="brand">
+        <span class="glyph">
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+            <circle cx="11" cy="4.2" r="2.4" fill="#35e0c5"/>
+            <circle cx="11" cy="11" r="3" fill="#35e0c5" opacity=".85"/>
+            <circle cx="11" cy="17.6" r="2.6" fill="#35e0c5" opacity=".7"/>
+            <path d="M6 8 L9 11 M16 8 L13 11 M5.5 14 L9 12 M16.5 14 L13 12 M11 6.6 L11 8" stroke="#35e0c5" stroke-width="1" opacity=".6"/>
+          </svg>
+        </span>
+        <h1>ant<b>bot</b></h1>
+        <span class="tag">127.0.0.1:8100</span>
+      </div>
+      <div class="telemetry">
+        <div class="tele">
+          <span class="k">Floor</span>
+          <span class="v flr"><button class="flrbtn" id="flrUp">▲</button><span id="teFloor" class="accent">z 7</span><button class="flrbtn" id="flrDn">▼</button></span>
+        </div>
+        <div class="tele"><span class="k">Bots</span><span class="v" id="teBots">0</span></div>
+        <div class="tele"><span class="k">Explored</span><span class="v" id="teExplored">28,979<small> tiles</small></span></div>
+        <div class="tele" id="teStuckWrap" style="display:none"><span class="k">Stuck</span><span class="v" id="teStuck" style="color:var(--amber,#e6b23e)">0</span></div>
+        <div class="tele"><span class="k">Following</span><span class="v accent" id="teFollow">—</span></div>
+      </div>
+    </div>
+
+    <nav class="modes" id="modes">
+      <button data-mode="normal" class="on">
+        <svg class="ic" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="1.5" width="13" height="13" rx="2" stroke="currentColor" stroke-width="1.3"/><circle cx="6" cy="6" r="1.4" fill="currentColor"/><circle cx="10.5" cy="10" r="1.4" fill="currentColor"/></svg>
+        Live
+      </button>
+      <button data-mode="path">
+        <svg class="ic" viewBox="0 0 16 16" fill="none"><circle cx="3.5" cy="12.5" r="1.8" stroke="currentColor" stroke-width="1.3"/><circle cx="12.5" cy="3.5" r="1.8" stroke="currentColor" stroke-width="1.3"/><path d="M4.6 11.4 C8 8 6 6 9 6 C11 6 11 4.6 11.4 4.6" stroke="currentColor" stroke-width="1.3" stroke-dasharray="1.6 1.8"/></svg>
+        Plan Path
+      </button>
+      <button data-mode="replay">
+        <svg class="ic" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.4" stroke="currentColor" stroke-width="1.3"/><path d="M6.6 5.6 L10.6 8 L6.6 10.4 Z" fill="currentColor"/></svg>
+        Replay
+      </button>
+    </nav>
+
+    <div class="rightbar">
+      <span class="clock mono" id="clock">--:--:--</span>
+      <button class="conn live" id="conn" title="Click to simulate connection loss">
+        <span class="led"></span><span id="connTxt">LIVE</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- ======================= MAIN ======================= -->
+  <div class="main">
+
+    <!-- ---------- LEFT: BOTS ---------- -->
+    <aside class="rail left">
+      <h2>Swarm <span class="count" id="botsCount">0 active</span></h2>
+      <div class="bots-tools">
+        <div class="search">
+          <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><circle cx="5.5" cy="5.5" r="4" stroke="#828b97" stroke-width="1.3"/><path d="M8.6 8.6 L11.5 11.5" stroke="#828b97" stroke-width="1.3"/></svg>
+          <input id="botSearch" placeholder="filter by name / status…" autocomplete="off">
+        </div>
+        <div class="chips" id="roleChips"></div>
+        <div class="row-tools">
+          <div class="seg" id="densitySeg">
+            <button data-d="comfortable" class="on">list</button>
+            <button data-d="compact">compact</button>
+            <button data-d="dense">dense</button>
+          </div>
+          <div class="mini">list · compact · dense scale with the swarm</div>
+        </div>
+      </div>
+      <div class="rail-body" id="botsList"></div>
+      <div id="botDetail"></div>
+    </aside>
+
+    <!-- ---------- CENTER: MAP ---------- -->
+    <main class="stage">
+      <div class="canvas-wrap" id="canvasWrap">
+        <canvas id="map"></canvas>
+        <div class="grid-fade"></div>
+
+        <div class="map-hud" id="mapHud">
+          <div class="hud-pill"><span>FLOOR</span> <b id="hudFloor">z 7</b></div>
+          <div class="hud-pill" id="hudMode"><span>LIVE</span> <b>auto-fit</b></div>
+        </div>
+
+        <div class="map-tools">
+          <button class="mtool" id="btnFit" title="Fit to explored area">⤢</button>
+          <button class="mtool" id="btnZin" title="Zoom in">+</button>
+          <button class="mtool" id="btnZout" title="Zoom out">−</button>
+          <button class="mtool" id="btnHeat" title="Coverage heatmap (planned)">≋</button>
+          <button class="mtool on" id="btnCreat" title="Show creatures (red=monster, blue=NPC, pale=player)">◈</button>
+          <button class="mtool on" id="btnIntent" title="Show what each bot is trying to reach (red ✕ = no route)">⌖</button>
+          <button class="mtool" id="btnBlocks" title="DEBUG: show blocked-tile types around the followed bot">▦</button>
+        </div>
+
+        <div class="block-legend" id="blockLegend" style="display:none"></div>
+
+        <div class="scalebar"><span id="scaleTxt">— tiles</span><span class="ln" id="scaleLn" style="width:80px"></span></div>
+
+        <!-- disconnected -->
+        <div class="down-veil">
+          <div class="spin"></div>
+          <div class="t">Connection lost</div>
+          <div class="s">last state 0.4s ago · retrying GET /state.json…</div>
+        </div>
+
+        <!-- first-run empty -->
+        <div class="empty" id="emptyState">
+          <div class="empty-card">
+            <div class="mark">
+              <svg width="46" height="46" viewBox="0 0 22 22" fill="none">
+                <circle cx="11" cy="4.2" r="2.4" fill="#35e0c5"/><circle cx="11" cy="11" r="3" fill="#35e0c5" opacity=".85"/><circle cx="11" cy="17.6" r="2.6" fill="#35e0c5" opacity=".7"/>
+                <path d="M6 8 L9 11 M16 8 L13 11 M5.5 14 L9 12 M16.5 14 L13 12 M11 6.6 L11 8" stroke="#35e0c5" stroke-width="1" opacity=".6"/>
+              </svg>
+            </div>
+            <h3>The colony is idle</h3>
+            <p>No bots are running. Launch scouts to start exploring and mapping the world — markers will appear on the map as they move.</p>
+            <div class="launch">
+              <div class="numfield">
+                <label>Scouts</label>
+                <div class="stepper"><button data-step="scouts:-1">−</button><input id="inScouts" value="3" inputmode="numeric"><button data-step="scouts:1">+</button></div>
+              </div>
+              <div class="numfield">
+                <label>Wanderers</label>
+                <div class="stepper"><button data-step="wanderers:-1">−</button><input id="inWanderers" value="0" inputmode="numeric"><button data-step="wanderers:1">+</button></div>
+              </div>
+            </div>
+            <button class="btn primary" id="btnLaunch" style="width:100%;justify-content:center;font-size:13px;padding:12px">
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 2 L11.5 7 L3 12 Z" fill="currentColor"/></svg>
+              Launch swarm
+            </button>
+            <div class="pool" style="margin-top:12px">account pool <b id="poolTxt">6</b> · GET /command?action=start&amp;scouts=3&amp;wanderers=0</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ---------- MODE DOCK ---------- -->
+      <div class="dock" id="dock">
+
+        <!-- normal / running controls -->
+        <div class="dock-pane on" data-pane="normal">
+          <div class="dock-group">
+            <span class="dock-label">Launch</span>
+            <div class="field-inline">
+              <label class="dock-label">scouts</label>
+              <div class="stepper"><button data-step="scouts:-1">−</button><input id="inScouts2" value="3" inputmode="numeric"><button data-step="scouts:1">+</button></div>
+            </div>
+            <div class="field-inline">
+              <label class="dock-label">wanderers</label>
+              <div class="stepper"><button data-step="wanderers:-1">−</button><input id="inWanderers2" value="0" inputmode="numeric"><button data-step="wanderers:1">+</button></div>
+            </div>
+            <button class="btn primary" id="btnStart"><svg width="12" height="12" viewBox="0 0 14 14"><path d="M3 2 L11.5 7 L3 12 Z" fill="currentColor"/></svg> Start</button>
+            <button class="btn danger" id="btnStop" disabled>■ Stop</button>
+            <button class="btn" id="btnReset" disabled>⟲ Reset to temple</button>
+          </div>
+          <div class="dock-sep"></div>
+          <div class="run-status" id="runStatus"><span class="led" style="background:var(--tx-faint)"></span> manager idle</div>
+          <div style="margin-left:auto" class="path-hint">pool <b class="mono" id="poolTxt2">6</b> · polling <b class="mono">/state.json</b> @ 400ms</div>
+        </div>
+
+        <!-- path inspector -->
+        <div class="dock-pane" data-pane="path">
+          <div class="dock-group">
+            <span class="pin-tag"><span class="p" style="background:var(--green)"></span> Start</span>
+            <span class="pin-tag"><span class="p" style="background:var(--red)"></span> End</span>
+            <span class="path-hint" id="pathHint">Click the map to drop a <b>start</b> pin.</span>
+            <button class="btn" id="btnClearPath" style="padding:7px 12px">Clear pins</button>
+          </div>
+          <div class="dock-sep"></div>
+          <div class="field-inline">
+            <label class="dock-label">char speed<br><span class="faint">game spd</span></label>
+            <div class="stepper"><button data-spd="-1">−</button><input id="inSpeed" value="200" inputmode="numeric" style="width:48px"><button data-spd="1">+</button></div>
+          </div>
+          <div class="path-report" id="pathReport">
+            <div class="cell"><div class="k">Distance</div><div class="v" id="rpDist">—</div></div>
+            <div class="cell"><div class="k">ETA</div><div class="v accent" id="rpEta">—</div></div>
+            <div class="cell"><div class="k">Walk steps</div><div class="v" id="rpSteps">—</div></div>
+            <div class="cell"><div class="k">Shortcuts</div><div class="v" id="rpHops">—</div></div>
+            <div class="cell"><div class="k">Gold cost</div><div class="v" id="rpGold">—</div></div>
+          </div>
+        </div>
+
+        <!-- replay -->
+        <div class="dock-pane replay-dock" data-pane="replay">
+          <div class="replay-top">
+            <span class="dock-label">Recording</span>
+            <select class="rec-select" id="recSelect"></select>
+            <div class="transport">
+              <button class="tbtn" id="rwBtn" title="−5s">«</button>
+              <button class="tbtn play" id="playBtn"><svg width="12" height="12" viewBox="0 0 14 14"><path d="M3 2 L11.5 7 L3 12 Z" fill="currentColor"/></svg></button>
+              <button class="tbtn" id="ffBtn" title="+5s">»</button>
+            </div>
+            <div class="speed" id="speedSel">
+              <button data-sp="0.5">0.5×</button><button data-sp="1" class="on">1×</button><button data-sp="2">2×</button><button data-sp="4">4×</button>
+            </div>
+            <div class="time"><b id="tCur">0:00</b> / <span id="tTot">1:00</span></div>
+          </div>
+          <div class="seek">
+            <div class="fill" id="seekFill" style="width:0"></div>
+            <input type="range" id="seek" min="0" max="1000" value="0">
+          </div>
+        </div>
+
+      </div>
+    </main>
+
+    <!-- ---------- RIGHT: EVENTS / REPLAY ---------- -->
+    <aside class="rail right">
+      <h2 id="rightTitle">Events <span class="count" id="evCount">0</span></h2>
+      <div id="rightNormal">
+        <div class="ev-tools" id="evTools">
+          <button class="chip on" data-sev="all">all</button>
+          <button class="chip" data-sev="error"><span class="swatch" style="background:var(--red)"></span>errors</button>
+          <button class="chip" data-sev="warning"><span class="swatch" style="background:var(--amber)"></span>warnings</button>
+          <button class="chip" data-sev="info"><span class="swatch" style="background:var(--accent)"></span>info</button>
+        </div>
+        <div class="rail-body" id="eventsList"></div>
+      </div>
+      <div id="rightReplay" class="hidden" style="display:flex;flex-direction:column;min-height:0;flex:1">
+        <div id="replayReadout"></div>
+        <div class="rail-body" id="timelineList"></div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+"use strict";
+/* =====================================================================
+   antbot dashboard — mock data + rendering. Pure vanilla, offline.
+   Everything renders from STATE (the /state.json shape). To go live,
+   replace pollTick() with fetch('/state.json') and call render(STATE).
+   ===================================================================== */
+
+
+/* ---------- color system ---------- */
+const BOT_PALETTE=["#e0655f","#e69b3e","#d7cf4a","#8fd04f","#4bd06a","#4bd0a8","#4bb8d0","#5f8fe0","#8f6fe0","#c85fd0","#e05fa0","#e08f6f"];
+function botColor(name){let h=0;for(let i=0;i<name.length;i++)h=(h*31+name.charCodeAt(i))>>>0;return BOT_PALETTE[h%BOT_PALETTE.length];}
+function hpColor(p){return p>60?"#4bd06a":p>25?"#e6b23e":"#ef4d52";}
+const SEV_COLOR={error:"#ef4d52",warning:"#e6b23e",info:"#35e0c5"};
+
+
+
+
+/* ---------- STATE (exactly /state.json shape; filled by the live poll) ---------- */
+const STATE={
+  floor:7, center:[0,0], focus:null,
+  bots:[],
+  tiles:[],
+  creatures:[],
+  explored_total:0,
+  events:[],
+  manager:"idle",
+  pool_size:6, default_scouts:3, default_wanderers:0,
+};
+let RECS=[];                 // GET /recordings result
+let floorOverride=null;      // z of a manually-browsed floor (null = follow the swarm)
+let replayTiles=[], replayFloor=null;   // floor backdrop for the replayed recording
+let firstFit=false;          // fit the view once, when the first tiles arrive
+function fmtStart(t){ try{ return new Date(t*1000).toLocaleString(); }catch(e){ return String(t); } }
+function fmtBytes(n){ if(n==null)return""; if(n<1024)return n+" B"; if(n<1048576)return (n/1024).toFixed(0)+" KB"; return (n/1048576).toFixed(1)+" MB"; }
+function activeTiles(){ return MODE==="replay"?replayTiles:STATE.tiles; }
+
+/* =====================================================================
+   MAP RENDERER
+   ===================================================================== */
+const canvas=document.getElementById("map");
+const ctx=canvas.getContext("2d");
+const wrap=document.getElementById("canvasWrap");
+let view={scale:1,ox:0,oy:0,userZoom:1,fitScale:1,cxWorld:0,cyWorld:0};
+let MODE="normal";
+let showCreaturesLive=true, showHeat=false;   // creatures on by default now they're live
+// Intent overlay defaults ON: it's the diagnostic that tells an idle bot
+// from one doomed to chase an unreachable tile forever.
+let showIntent=true;
+// Block inspector: a DEBUG overlay, default OFF. When on we poll /debug.json for the
+// followed bot and paint the different KINDS of blocked tile, each its own colour.
+let showBlocks=false;
+let BLOCKS=null;           // last /debug.json payload
+let blocksInFlight=false;  // don't stack fetches if a poll is slow
+// One colour per block category, with a human label for the legend.
+const BLOCK_STYLE={
+  structural:{c:"#5a6b7a",label:"structural (wall/water)"},
+  runtime:{c:"#e6b23e",label:"runtime-blocked (server refused, TTL)"},
+  hazard:{c:"#b06bd8",label:"hazard (teleport/floor-change)"},
+  unreachable:{c:"#ef4d52",label:"unreachable (written off)"},
+  occupied:{c:"#35e0c5",label:"occupied (creature)"}
+};
+
+function resizeCanvas(){
+  const dpr=Math.min(2,window.devicePixelRatio||1);
+  const w=wrap.clientWidth, h=wrap.clientHeight;
+  canvas.width=w*dpr; canvas.height=h*dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+function tileBounds(tiles){
+  let minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;
+  for(const t of tiles){if(t[0]<minx)minx=t[0];if(t[0]>maxx)maxx=t[0];if(t[1]<miny)miny=t[1];if(t[1]>maxy)maxy=t[1];}
+  return {minx,miny,maxx,maxy};
+}
+function fitView(){
+  const tiles=activeTiles(); if(!tiles.length)return;
+  const b=tileBounds(tiles);
+  const w=wrap.clientWidth, h=wrap.clientHeight, pad=40;
+  const spanX=(b.maxx-b.minx)+1, spanY=(b.maxy-b.miny)+1;
+  view.fitScale=Math.min((w-pad*2)/spanX,(h-pad*2)/spanY);
+  view.cxWorld=(b.minx+b.maxx)/2; view.cyWorld=(b.miny+b.maxy)/2;
+}
+function worldToScreen(x,y){
+  const s=view.fitScale*view.userZoom;
+  const w=wrap.clientWidth, h=wrap.clientHeight;
+  return [w/2+(x-view.cxWorld)*s, h/2+(y-view.cyWorld)*s];
+}
+
+/* path-inspector state */
+const path={start:null,end:null,waypoints:[],report:null};
+/* replay state */
+let REC=null, replay={t:0,playing:false,speed:1};
+
+let animT=0;
+function draw(){
+  animT+=1;
+  const w=wrap.clientWidth, h=wrap.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  // faint reference grid
+  drawRefGrid(w,h);
+
+  const s=view.fitScale*view.userZoom;
+  const ts=Math.max(1.2,s*0.92); // tile draw size
+
+  if(MODE==="replay"&&REC){ drawReplay(w,h,s,ts); }
+  else if(MODE==="path"){ drawTilesDim(ts); drawPath(); }
+  else { drawTilesLive(ts,s); }
+
+  updateScaleBar(s);
+  requestAnimationFrame(draw);
+}
+
+function drawRefGrid(w,h){
+  ctx.strokeStyle="rgba(150,170,190,0.035)"; ctx.lineWidth=1;
+  const step=44;
+  for(let x=(w/2)%step;x<w;x+=step){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
+  for(let y=(h/2)%step;y<h;y+=step){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+}
+
+function drawTilesLive(ts,s){
+  const tiles=STATE.tiles;
+  for(let i=0;i<tiles.length;i++){
+    const t=tiles[i]; const p=worldToScreen(t[0],t[1]);
+    ctx.fillStyle=t[2]; ctx.fillRect(p[0]-ts/2,p[1]-ts/2,ts,ts);
+  }
+  if(showHeat)drawHeat(ts);
+  if(showBlocks)drawBlocks(ts);
+  drawIntent();
+  // creatures (planned on live; drawn when toggled)
+  if(showCreaturesLive)drawLiveCreatures(s);
+  // bot markers — only those on the floor currently shown
+  for(const b of STATE.bots){ if(b.z!==STATE.floor)continue; drawBot(b,s,b.name===STATE.focus); }
+}
+
+function drawTilesDim(ts){
+  const tiles=activeTiles();
+  for(let i=0;i<tiles.length;i++){
+    const t=tiles[i]; const p=worldToScreen(t[0],t[1]);
+    // desaturate/darken for planning backdrop
+    ctx.globalAlpha=0.55; ctx.fillStyle=t[2]; ctx.fillRect(p[0]-ts/2,p[1]-ts/2,ts,ts);
+  }
+  ctx.globalAlpha=1;
+}
+
+function drawHeat(ts){
+  // planned coverage heatmap stub: overlay warm glow near center
+  const [cxp,cyp]=worldToScreen(view.cxWorld,view.cyWorld);
+  const g=ctx.createRadialGradient(cxp,cyp,10,cxp,cyp,220);
+  g.addColorStop(0,"rgba(230,178,62,.32)");g.addColorStop(.5,"rgba(239,77,82,.16)");g.addColorStop(1,"rgba(0,0,0,0)");
+  ctx.fillStyle=g; ctx.fillRect(0,0,wrap.clientWidth,wrap.clientHeight);
+}
+
+/* Live creatures currently in view, pooled from every bot (STATE.creatures). Coloured
+   by KIND: monsters red (danger), NPCs blue (landmarks — shopkeepers/bankers), players
+   pale (other people, incl. our own bots' targets). These are what the block inspector
+   counts as "occupied" and what find_path_toward routes around — so a bot boxed in by a
+   ring of monsters (exactly Druid 3's trap) now shows it at a glance. */
+const CREATURE_STYLE={monster:"#ef4d52",npc:"#4aa3ff",player:"#dfe6ec"};
+function drawLiveCreatures(s){
+  const list=STATE.creatures||[];
+  for(const c of list){
+    if(c.z!==undefined&&c.z!==STATE.floor)continue;
+    const p=worldToScreen(c.x,c.y);
+    creatureDot(p[0],p[1],CREATURE_STYLE[c.kind]||"#ef4d52",c.kind);
+    // wounded creatures (a bot is fighting it): a thin health pip
+    if(c.hp!=null&&c.hp<100){
+      ctx.fillStyle="rgba(239,77,82,.85)";ctx.fillRect(p[0]-4,p[1]+5,8*(c.hp/100),1.5);
+    }
+  }
+}
+function creatureDot(x,y,col,kind){
+  col=col||"#ef4d52";
+  ctx.save();ctx.translate(x,y);
+  ctx.shadowColor=col;ctx.shadowBlur=4;
+  if(kind==="npc"){
+    // NPC: a square — reads as "fixture / landmark", distinct from a roaming diamond.
+    ctx.fillStyle=col;ctx.strokeStyle="rgba(0,0,0,.65)";ctx.lineWidth=1;
+    ctx.beginPath();ctx.rect(-3.3,-3.3,6.6,6.6);ctx.fill();ctx.shadowBlur=0;ctx.stroke();
+  }else{
+    // monster / player: a diamond.
+    ctx.beginPath();
+    ctx.moveTo(0,-4.2);ctx.lineTo(4.2,0);ctx.lineTo(0,4.2);ctx.lineTo(-4.2,0);ctx.closePath();
+    ctx.fillStyle=col;ctx.fill();ctx.shadowBlur=0;
+    ctx.strokeStyle="rgba(0,0,0,.65)";ctx.lineWidth=1;ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawBot(b,s,followed){
+  const p=worldToScreen(b.x,b.y);
+  const col=botColor(b.name);
+  const r=followed?6.5:5;
+  if(followed){
+    const pulse=(Math.sin(animT*0.08)+1)/2;
+    ctx.strokeStyle=`rgba(53,224,197,${0.35+pulse*0.4})`;ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.arc(p[0],p[1],11+pulse*7,0,Math.PI*2);ctx.stroke();
+    ctx.strokeStyle="rgba(53,224,197,.55)";ctx.lineWidth=1;
+    ctx.beginPath();ctx.arc(p[0],p[1],9,0,Math.PI*2);ctx.stroke();
+  }
+  // glow
+  ctx.shadowColor=col; ctx.shadowBlur=followed?12:6;
+  ctx.fillStyle=col; ctx.beginPath();ctx.arc(p[0],p[1],r,0,Math.PI*2);ctx.fill();
+  ctx.shadowBlur=0;
+  ctx.strokeStyle="rgba(8,9,11,.9)";ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(p[0],p[1],r,0,Math.PI*2);ctx.stroke();
+  if(followed){
+    ctx.fillStyle="#dfe6ec";ctx.font="600 11px ui-monospace,Menlo,monospace";ctx.textAlign="center";
+    ctx.fillText(b.name,p[0],p[1]-16);
+  }
+}
+
+/* Intent overlay: what each bot is TRYING to do.
+   A bot that stands still looks identical whether it's idle, lagged, or doomed. This
+   draws the difference: its goal, the route it found, and — the one that matters — a
+   red goal with no route at all, meaning it wants to reach a tile it cannot path to.
+   That's the signature of a bot targeting somewhere walled off (a walkable tile sealed
+   behind a shop counter, say): it will burn its whole session trying and never move. */
+/* Block inspector (DEBUG): paint the different KINDS of blocked tile around the
+   followed bot, each its own colour, so you can SEE why a bot won't move. structural =
+   walls/water (grey), runtime = the server refused us here and it'll expire (amber),
+   hazard = teleport source (purple), unreachable = written off (red), occupied = a
+   creature is there (teal). Data comes from /debug.json, fetched only while this is on. */
+function drawBlocks(ts){
+  if(!BLOCKS)return;
+  const sz=Math.max(2,ts*0.9);
+  ctx.save();
+  ctx.globalAlpha=0.75;
+  for(const cat of ["structural","hazard","unreachable","runtime","occupied"]){
+    const list=BLOCKS[cat]; if(!list||!list.length)continue;
+    ctx.fillStyle=BLOCK_STYLE[cat].c;
+    for(const t of list){
+      const p=worldToScreen(t[0],t[1]);
+      ctx.fillRect(p[0]-sz/2,p[1]-sz/2,sz,sz);
+    }
+  }
+  // runtime blocks carry a TTL — outline them so they read as "temporary", and when
+  // zoomed in enough, print the seconds left. This is the layer that boxes bots in.
+  const rt=BLOCKS.runtime||[];
+  ctx.globalAlpha=1;ctx.strokeStyle="#1a1205";ctx.lineWidth=1;
+  for(const t of rt){
+    const p=worldToScreen(t[0],t[1]);
+    ctx.strokeRect(p[0]-sz/2,p[1]-sz/2,sz,sz);
+    if(ts>=14&&t[2]!==undefined){
+      ctx.fillStyle="#1a1205";ctx.font="700 8px ui-monospace,monospace";ctx.textAlign="center";
+      ctx.fillText((t[2]>0?t[2].toFixed(0)+"s":"·"),p[0],p[1]+3);
+    }
+  }
+  ctx.restore();
+}
+
+function drawIntent(){
+  if(!showIntent)return;
+  ctx.save();
+  for(const b of STATE.bots){
+    if(b.z!==STATE.floor||!b.goal)continue;
+    if(b.goal[2]!==STATE.floor)continue;
+    const from=worldToScreen(b.x,b.y), to=worldToScreen(b.goal[0],b.goal[1]);
+    const col=b.stuck?"#e6b23e":botColor(b.name);
+    // the planned route, tile by tile
+    if(b.plan&&b.plan.length){
+      ctx.strokeStyle=col;ctx.globalAlpha=.55;ctx.lineWidth=1.6;
+      ctx.setLineDash([]);ctx.lineJoin="round";ctx.beginPath();
+      ctx.moveTo(from[0],from[1]);
+      for(const t of b.plan){const p=worldToScreen(t[0],t[1]);ctx.lineTo(p[0],p[1]);}
+      ctx.stroke();
+    }
+    // no route: dashed straight line to the unreachable goal, so it reads as "wants
+    // to go there" rather than "is going there"
+    if(b.stuck){
+      ctx.strokeStyle=col;ctx.globalAlpha=.5;ctx.lineWidth=1.4;ctx.setLineDash([3,4]);
+      ctx.beginPath();ctx.moveTo(from[0],from[1]);ctx.lineTo(to[0],to[1]);ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // goal marker. Amber, not red: the minimap paints WALLS red, so a small red marker
+    // is invisible against exactly the terrain it tends to sit next to. A dark halo
+    // underneath lifts it off whatever it lands on, and the label says what's wrong
+    // without needing the legend.
+    ctx.globalAlpha=1;
+    if(b.stuck){
+      const pulse=(Math.sin(animT*0.12)+1)/2;
+      ctx.fillStyle="rgba(8,9,11,.72)";
+      ctx.beginPath();ctx.arc(to[0],to[1],11,0,Math.PI*2);ctx.fill();
+      ctx.strokeStyle="#e6b23e";ctx.lineWidth=2;
+      ctx.beginPath();ctx.arc(to[0],to[1],8,0,Math.PI*2);ctx.stroke();
+      ctx.globalAlpha=.30+pulse*0.5;
+      ctx.beginPath();ctx.arc(to[0],to[1],12+pulse*6,0,Math.PI*2);ctx.stroke();
+      ctx.globalAlpha=1;
+      ctx.lineWidth=2.2;
+      ctx.beginPath();
+      ctx.moveTo(to[0]-4.5,to[1]-4.5);ctx.lineTo(to[0]+4.5,to[1]+4.5);
+      ctx.moveTo(to[0]+4.5,to[1]-4.5);ctx.lineTo(to[0]-4.5,to[1]+4.5);
+      ctx.stroke();
+      ctx.fillStyle="#e6b23e";ctx.font="700 9px ui-monospace,Menlo,monospace";
+      ctx.textAlign="center";
+      ctx.strokeStyle="rgba(8,9,11,.9)";ctx.lineWidth=3;
+      ctx.strokeText("NO ROUTE",to[0],to[1]-15);
+      ctx.fillText("NO ROUTE",to[0],to[1]-15);
+    }else{
+      ctx.strokeStyle=col;ctx.lineWidth=1.6;
+      ctx.beginPath();ctx.arc(to[0],to[1],4,0,Math.PI*2);ctx.stroke();
+    }
+  }
+  ctx.globalAlpha=1;ctx.restore();
+}
+
+/* dense marker mode when many bots */
+function drawBotsDense(){
+  for(const b of STATE.bots){
+    const p=worldToScreen(b.x,b.y);
+    ctx.fillStyle=botColor(b.name);ctx.fillRect(p[0]-1.4,p[1]-1.4,2.8,2.8);
+  }
+}
+
+function drawPath(){
+  ctx.save();
+  if(path.start&&path.end){
+    // route line
+    ctx.strokeStyle="rgba(53,224,197,.9)";ctx.lineWidth=2.4;ctx.setLineDash([]);ctx.lineJoin="round";
+    ctx.beginPath();
+    const pts=[path.start,...path.waypoints,path.end].map(w=>worldToScreen(w[0],w[1]));
+    ctx.moveTo(pts[0][0],pts[0][1]);for(let i=1;i<pts.length;i++)ctx.lineTo(pts[i][0],pts[i][1]);
+    ctx.shadowColor="var";ctx.strokeStyle="rgba(53,224,197,.9)";ctx.stroke();
+    // waypoint dots
+    for(let i=1;i<pts.length-1;i++){ctx.fillStyle="#0b0c0e";ctx.strokeStyle="#35e0c5";ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(pts[i][0],pts[i][1],3,0,Math.PI*2);ctx.fill();ctx.stroke();}
+  }
+  if(path.start)drawPin(path.start,"#4bd06a","S");
+  if(path.end)drawPin(path.end,"#ef4d52","E");
+  ctx.restore();
+}
+function drawPin(w,color,label){
+  const p=worldToScreen(w[0],w[1]);
+  ctx.save();ctx.translate(p[0],p[1]);
+  ctx.fillStyle=color;ctx.strokeStyle="rgba(8,9,11,.85)";ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.arc(0,-11,7,Math.PI*0.15,Math.PI*0.85+Math.PI,true);ctx.lineTo(0,0);ctx.closePath();
+  ctx.shadowColor="rgba(0,0,0,.5)";ctx.shadowBlur=6;ctx.fill();ctx.shadowBlur=0;ctx.stroke();
+  ctx.fillStyle="#04211d";ctx.font="700 9px ui-monospace,monospace";ctx.textAlign="center";ctx.textBaseline="middle";
+  ctx.fillText(label,0,-11);
+  ctx.restore();
+}
+
+function drawReplay(w,h,s,ts){
+  // dim floor tiles as backdrop
+  drawTilesDim(ts);
+  const snap=currentSnapshot();
+  if(!snap)return;
+  // creatures on the bot's own floor (recordings also capture ones a floor away)
+  for(const c of (snap.creatures||[])){ if(c.z!==snap.z)continue; const p=worldToScreen(c.x,c.y);creatureDot(p[0],p[1]);
+    // tiny hp tick
+    ctx.fillStyle="rgba(239,77,82,.5)";ctx.fillRect(p[0]-4,p[1]+6,8*((c.hp||0)/100),1.5);
+  }
+  // the replayed bot
+  const p=worldToScreen(snap.x,snap.y);
+  const pulse=(Math.sin(animT*0.08)+1)/2;
+  ctx.strokeStyle=`rgba(53,224,197,${0.3+pulse*0.4})`;ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(p[0],p[1],12+pulse*6,0,Math.PI*2);ctx.stroke();
+  ctx.shadowColor="#35e0c5";ctx.shadowBlur=12;ctx.fillStyle="#35e0c5";ctx.beginPath();ctx.arc(p[0],p[1],6,0,Math.PI*2);ctx.fill();ctx.shadowBlur=0;
+  ctx.fillStyle="#dfe6ec";ctx.font="600 11px ui-monospace,monospace";ctx.textAlign="center";
+  ctx.fillText(REC.header.bot,p[0],p[1]-16);
+}
+
+function updateScaleBar(s){
+  // pick a round tile count near 80px
+  const target=80; let n=Math.max(1,Math.round(target/ (s||1)));
+  const px=Math.round(n*s);
+  const ln=document.getElementById("scaleLn"); ln.style.width=Math.min(160,Math.max(20,px))+"px";
+  document.getElementById("scaleTxt").textContent=n+" tiles";
+}
+
+/* =====================================================================
+   MODE SWITCHING
+   ===================================================================== */
+function setMode(m){
+  MODE=m;
+  document.querySelectorAll("#modes button").forEach(b=>b.classList.toggle("on",b.dataset.mode===m));
+  document.querySelectorAll(".dock-pane").forEach(p=>p.classList.toggle("on",p.dataset.pane===m));
+  const hud=document.getElementById("hudMode");
+  // right rail swaps between events and replay-timeline
+  const isReplay=m==="replay";
+  document.getElementById("rightNormal").classList.toggle("hidden",isReplay);
+  document.getElementById("rightReplay").classList.toggle("hidden",!isReplay);
+  document.getElementById("rightTitle").firstChild.textContent=isReplay?"Timeline ":"Events ";
+  document.getElementById("evCount").style.display=isReplay?"none":"";
+  // map hud label
+  hud.querySelector("span").textContent=m==="normal"?"LIVE":m==="path"?"PLAN PATH":"REPLAY";
+  hud.querySelector("b").textContent=m==="normal"?"auto-fit":m==="path"?"drop pins":"scrubbing";
+  if(m==="replay"){ if(!REC && RECS.length)loadRecording(RECS[0].file); renderTimeline(); renderReadout(); }
+  view.userZoom=1; fitView();
+}
+
+/* =====================================================================
+   PANELS
+   ===================================================================== */
+let densityMode="comfortable";
+let sevFilter="all", search="", roleFilter="all";
+
+/* synthesize a large swarm for the scale demo (mockup only) */
+
+
+
+function fmtNum(n){return n.toLocaleString("en-US");}
+function agoTxt(s){if(s<60)return s+"s ago";const m=(s/60)|0;return m+"m"+(s%60?" "+(s%60)+"s":"")+" ago";}
+
+function filteredBots(){
+  return STATE.bots.filter(b=>{
+    if(roleFilter!=="all"&&b.role!==roleFilter)return false;
+    if(search){const q=search.toLowerCase();if(!(b.name.toLowerCase().includes(q)||b.status.toLowerCase().includes(q)||b.character.toLowerCase().includes(q)))return false;}
+    return true;
+  });
+}
+
+function renderRoleChips(){
+  const el=document.getElementById("roleChips");
+  const counts={}; for(const b of STATE.bots)counts[b.role]=(counts[b.role]||0)+1;
+  const roles=Object.keys(counts).sort();
+  let html=`<button class="chip ${roleFilter==='all'?'on':''}" data-role="all">all <span class="n">${STATE.bots.length}</span></button>`;
+  const roleCol={scout:"#4bb8d0",wanderer:"#8f6fe0",hauler:"#e69b3e",supplier:"#8fd04f",hunter:"#ef4d52"};
+  for(const r of roles)html+=`<button class="chip ${roleFilter===r?'on':''}" data-role="${r}"><span class="swatch" style="background:${roleCol[r]||'#828b97'}"></span>${r} <span class="n">${counts[r]}</span></button>`;
+  el.innerHTML=html;
+  el.querySelectorAll(".chip").forEach(c=>c.onclick=()=>{roleFilter=c.dataset.role;renderBots();renderRoleChips();});
+}
+
+function renderBots(){
+  const list=document.getElementById("botsList");
+  const bots=filteredBots();
+  document.getElementById("botsCount").textContent=STATE.bots.length+" active";
+  document.getElementById("teBots").textContent=STATE.bots.length;
+
+  if(!STATE.bots.length){ list.innerHTML=`<div class="dense-note">No bots running.<br>Use <b class="mono" style="color:var(--accent)">Start</b> below to launch the swarm.</div>`; renderRoleChips(); return; }
+
+  // DENSE mode (many bots) → grouped counts + swatch grid
+  if(densityMode==="dense"||bots.length>60){
+    const groups={};
+    for(const b of bots){(groups[b.status.split(":")[0]]=groups[b.status.split(":")[0]]||[]).push(b);}
+    let html=`<div class="dense-note">Showing <b style="color:var(--accent)">${bots.length}</b> bots as density swatches grouped by status. Click any cell to follow. <span class="faint">(real build virtualizes rows)</span></div>`;
+    for(const g of Object.keys(groups).sort()){
+      html+=`<div class="grouphdr">${g}<span class="gc mono">${groups[g].length}</span></div><div class="dense-grid">`;
+      for(const b of groups[g]){
+        const dead=b.hp_percent<25;
+        html+=`<div class="d" data-bot="${b.name}" title="${b.name} · ${b.status} · ${b.hp_percent}%" style="background:${botColor(b.name)};${dead?'box-shadow:0 0 0 1.5px var(--red)':''};${b.name===STATE.focus?'outline:2px solid var(--accent);outline-offset:1px':''}"></div>`;
+      }
+      html+=`</div>`;
+    }
+    list.innerHTML=html;
+    list.querySelectorAll(".d").forEach(d=>d.onclick=()=>follow(d.dataset.bot));
+    renderRoleChips(); renderDetail();
+    return;
+  }
+
+  // LIST / COMPACT mode → grouped by role
+  const byRole={};
+  for(const b of bots)(byRole[b.role]=byRole[b.role]||[]).push(b);
+  const roleOrder=["scout","wanderer","hauler","supplier","hunter"];
+  const roles=Object.keys(byRole).sort((a,b)=>roleOrder.indexOf(a)-roleOrder.indexOf(b));
+  let html="";
+  const singleRole=roles.length<=1;
+  for(const r of roles){
+    if(!singleRole)html+=`<div class="grouphdr">${r}s<span class="gc mono">${byRole[r].length}</span></div>`;
+    for(const b of byRole[r]){
+      const c=botColor(b.name);
+      html+=`<div class="bot ${densityMode==='compact'?'compact':''} ${b.name===STATE.focus?'sel':''}" data-bot="${b.name}">
+        <span class="dot" style="background:${c}"></span>
+        <div class="idn"><div class="nm">${b.name}${b.stuck?' <span title="wants to reach '+b.goal.slice(0,2).join(',')+' but has no route there" style="color:var(--red)">⌀</span>':''}</div><div class="st">${b.stuck?'<span style="color:var(--red)">no route to '+b.goal.slice(0,2).join(',')+'</span>':b.status} <span class="lvl">· lv ${b.level}</span></div></div>
+        <div class="hpwrap"><div class="hpbar"><i style="width:${b.hp_percent}%;background:${hpColor(b.hp_percent)}"></i></div><span class="hp-n">${b.hp_percent}%</span></div>
+      </div>`;
+    }
+  }
+  list.innerHTML=html;
+  list.querySelectorAll(".bot").forEach(el=>el.onclick=()=>follow(el.dataset.bot));
+  renderRoleChips(); renderDetail();
+}
+
+function renderDetail(){
+  const el=document.getElementById("botDetail");
+  const b=STATE.bots.find(x=>x.name===STATE.focus);
+  if(!b){el.innerHTML="";document.getElementById("teFollow").textContent="—";return;}
+  document.getElementById("teFollow").textContent=b.name;
+  const c=botColor(b.name);
+  el.innerHTML=`<div class="detail">
+    <div class="dh"><span class="dot" style="background:${c};box-shadow:0 0 10px ${c}"></span><span class="nm">${b.name}</span><span class="ch">${b.character}</span></div>
+    <div class="detstats">
+      <div class="dstat full"><div class="k">Status</div><div class="v" style="color:${b.hp_percent<25?'var(--red)':'var(--tx)'}">${b.status}</div></div>
+      <div class="dstat"><div class="k">Level</div><div class="v">${b.level}</div></div>
+      <div class="dstat"><div class="k">Position</div><div class="v" style="font-size:12px">${b.x}, ${b.y} · z${b.z}</div></div>
+      <div class="dstat full"><div class="k">Health &nbsp;<span style="color:${hpColor(b.hp_percent)}">${fmtNum(b.hp)} / ${fmtNum(b.max_hp)}</span></div><div class="bar2"><i style="width:${b.hp_percent}%;background:${hpColor(b.hp_percent)}"></i></div></div>
+      <div class="dstat full"><div class="k">Mana &nbsp;<span style="color:#5f8fe0">${fmtNum(b.mana)} / ${fmtNum(b.max_mana)}</span></div><div class="bar2"><i style="width:${Math.round(b.mana/b.max_mana*100)}%;background:#5f8fe0"></i></div></div>
+    </div>
+  </div>`;
+}
+
+function follow(name){
+  floorOverride=null;                       // following returns us to the live swarm floor
+  document.getElementById("hudMode").querySelector("span").textContent=MODE==="normal"?"LIVE":MODE.toUpperCase();
+  STATE.focus=STATE.focus===name?null:name;
+  const b=STATE.bots.find(x=>x.name===STATE.focus);
+  if(b){view.cxWorld=b.x;view.cyWorld=b.y;view.userZoom=Math.max(view.userZoom,1.6);}
+  else fitView();
+  renderBots();
+}
+
+/* events */
+function renderEvents(){
+  const list=document.getElementById("eventsList");
+  const evs=STATE.events.filter(e=>sevFilter==="all"||e.level===sevFilter);
+  document.getElementById("evCount").textContent=STATE.events.length;
+  if(!STATE.events.length){list.innerHTML=`<div class="dense-note">No events yet. Warnings and errors from the swarm will stream here.</div>`;return;}
+  list.innerHTML=evs.map(e=>`<div class="event" data-pos="${e.pos.join(',')}">
+    <span class="sev" style="background:${SEV_COLOR[e.level]}"></span>
+    <div>
+      <div class="top"><span class="cat" style="color:${SEV_COLOR[e.level]}">${e.category}</span><span class="ago">${agoTxt(e.ago)}</span></div>
+      <div class="msg">${e.message}</div>
+      <div class="meta"><span><b>${e.bot}</b></span><span>@ ${e.pos[0]}, ${e.pos[1]} · z${e.pos[2]}</span></div>
+    </div>
+  </div>`).join("");
+  list.querySelectorAll(".event").forEach(el=>el.onclick=()=>{
+    const [x,y]=el.dataset.pos.split(",").map(Number);
+    view.cxWorld=x;view.cyWorld=y;view.userZoom=Math.max(view.userZoom,1.8);
+    toast("ok","centered on "+x+", "+y);
+  });
+}
+
+/* =====================================================================
+   REPLAY panel
+   ===================================================================== */
+async function loadRecording(file){
+  try{
+    const d=await (await fetch("/recording?file="+encodeURIComponent(file),{cache:"no-store"})).json();
+    if(d.error){ toast("warn",d.error); return; }
+    const recs=(d.records||[]).slice().sort((a,b)=>a.t-b.t);
+    const t0=recs.length?recs[0].t:0;
+    for(const r of recs) r.t=r.t-t0;                 // wall-clock epoch → relative seconds
+    const dur=recs.length?recs[recs.length-1].t:0;
+    REC={header:d.header||{},records:recs,duration:dur};
+    replay.t=0; replay.playing=false; setPlayIcon();
+    document.getElementById("tTot").textContent=fmtTime(REC.duration);
+    replayFloor=null; await ensureReplayFloor();     // load the floor the recording is on
+    updateSeek(); renderTimeline(); renderReadout(); fitView();
+  }catch(e){ toast("warn","could not load recording"); }
+}
+/* load the explored-map backdrop for the recording's current floor (once per floor) */
+async function ensureReplayFloor(){
+  if(!REC)return;
+  const snap=currentSnapshot()||REC.records.find(r=>r.type==="snapshot");
+  if(!snap||replayFloor===snap.z)return;
+  try{ const m=await (await fetch("/map?z="+snap.z,{cache:"no-store"})).json(); replayTiles=m.tiles||[]; replayFloor=snap.z; }
+  catch(e){ replayTiles=[]; }
+}
+function currentSnapshot(){
+  if(!REC)return null;
+  let snap=null;
+  for(const r of REC.records){if(r.type==="snapshot"&&r.t<=replay.t)snap=r;else if(r.t>replay.t)break;}
+  return snap;
+}
+function fmtTime(s){s=Math.max(0,Math.round(s));return Math.floor(s/60)+":"+String(s%60).padStart(2,"0");}
+function updateSeek(){
+  const pct=REC?replay.t/REC.duration:0;
+  document.getElementById("seek").value=Math.round(pct*1000);
+  document.getElementById("seekFill").style.width=(pct*100)+"%";
+  document.getElementById("tCur").textContent=fmtTime(replay.t);
+}
+function renderReadout(){
+  const el=document.getElementById("replayReadout");
+  if(!REC){el.innerHTML="";return;}
+  const s=currentSnapshot();
+  const hpP=s?Math.round(s.hp/s.maxhp*100):0;
+  el.innerHTML=`<div class="readout">
+    <div class="rh">${REC.header.bot} · ${REC.header.character} · ${REC.header.mode}</div>
+    <div class="detstats">
+      <div class="dstat"><div class="k">Sim time</div><div class="v accent">${fmtTime(replay.t)}</div></div>
+      <div class="dstat"><div class="k">Status</div><div class="v" style="font-size:12px">${s?s.status:"—"}</div></div>
+      <div class="dstat"><div class="k">Position</div><div class="v" style="font-size:12px">${s?s.x+", "+s.y+" z"+s.z:"—"}</div></div>
+      <div class="dstat"><div class="k">Nearby creatures</div><div class="v" style="color:${s&&s.creatures.length?'var(--red)':'var(--tx)'}">${s?s.creatures.length:0}</div></div>
+      <div class="dstat full"><div class="k">Health &nbsp;<span style="color:${hpColor(hpP)}">${s?fmtNum(s.hp)+" / "+fmtNum(s.maxhp):"—"}</span></div><div class="bar2"><i style="width:${hpP}%;background:${hpColor(hpP)}"></i></div></div>
+      <div class="dstat full"><div class="k">Mana</div><div class="bar2"><i style="width:${s?Math.round(s.mana/s.maxmana*100):0}%;background:#5f8fe0"></i></div></div>
+    </div>
+  </div>`;
+}
+const TL_COLOR={action:"#4bb8d0",decision:"#8f6fe0",event:"#e6b23e",snapshot:"#565e68"};
+function renderTimeline(){
+  const list=document.getElementById("timelineList");
+  if(!REC){list.innerHTML="";return;}
+  const rows=REC.records.filter(r=>r.type!=="snapshot");
+  let curIdx=-1;
+  rows.forEach((r,i)=>{if(r.t<=replay.t)curIdx=i;});
+  list.innerHTML=rows.map((r,i)=>{
+    const label=r.type;
+    const col=r.type==="event"?SEV_COLOR[r.level]:TL_COLOR[r.type];
+    const text=r.type==="action"?r.action:r.type==="decision"?r.what:r.category+" · "+r.msg;
+    const cls=i===curIdx?"now":r.t<=replay.t?"past":"";
+    return `<div class="tl-row ${cls}" data-t="${r.t}">
+      <div class="tl-t">${fmtTime(r.t)}</div>
+      <div class="tl-body"><span class="ty" style="color:${col};background:${col}22">${label}</span><div class="tx">${text}</div></div>
+    </div>`;
+  }).join("");
+  list.querySelectorAll(".tl-row").forEach(el=>el.onclick=()=>{replay.t=+el.dataset.t;afterSeek();});
+  // keep current in view without scrollIntoView
+  const now=list.querySelector(".tl-row.now");
+  if(now)list.scrollTop=now.offsetTop-list.clientHeight/2;
+}
+function afterSeek(){updateSeek();renderReadout();renderTimeline();ensureReplayFloor();}
+
+/* replay clock */
+let lastTs=performance.now();
+function replayTick(now){
+  const dt=(now-lastTs)/1000; lastTs=now;
+  if(MODE==="replay"&&REC&&replay.playing){
+    replay.t+=dt*replay.speed;
+    if(replay.t>=REC.duration){replay.t=REC.duration;replay.playing=false;setPlayIcon();}
+    afterSeek();
+  }
+  requestAnimationFrame(replayTick);
+}
+function setPlayIcon(){
+  const b=document.getElementById("playBtn");
+  b.innerHTML=replay.playing
+    ?'<svg width="12" height="12" viewBox="0 0 14 14"><rect x="3" y="2.5" width="3" height="9" fill="currentColor"/><rect x="8" y="2.5" width="3" height="9" fill="currentColor"/></svg>'
+    :'<svg width="12" height="12" viewBox="0 0 14 14"><path d="M3 2 L11.5 7 L3 12 Z" fill="currentColor"/></svg>';
+}
+
+/* =====================================================================
+   PATH INSPECTOR
+   ===================================================================== */
+function screenToWorld(sx,sy){
+  const s=view.fitScale*view.userZoom;const w=wrap.clientWidth,h=wrap.clientHeight;
+  return [Math.round(view.cxWorld+(sx-w/2)/s),Math.round(view.cyWorld+(sy-h/2)/s)];
+}
+async function computePath(){
+  if(!(path.start&&path.end)){path.report=null;return;}
+  const [x0,y0]=path.start,[x1,y1]=path.end, z=STATE.floor;
+  const sp=parseInt(document.getElementById("inSpeed").value)||200;
+  const q=`sx=${x0}&sy=${y0}&sz=${z}&ex=${x1}&ey=${y1}&ez=${z}&speed=${sp}`;
+  let p; try{ p=await (await fetch("/plan?"+q,{cache:"no-store"})).json(); }catch(e){ toast("warn","plan failed"); return; }
+  if(!p.found){
+    path.waypoints=[]; path.report=null;
+    ["rpEta","rpSteps","rpHops","rpGold"].forEach(id=>document.getElementById(id).textContent="—");
+    document.getElementById("rpDist").innerHTML='<span style="color:var(--red)">no route</span>';
+    document.getElementById("pathHint").innerHTML="No route between those tiles. Click to re-pick the <b>start</b> pin.";
+    return;
+  }
+  // draw the real route (interior points on this floor); the pins are start/end
+  path.waypoints=(p.path||[]).slice(1,-1).filter(pt=>pt[2]===z).map(pt=>[pt[0],pt[1]]);
+  const s=p.summary||{};
+  path.report=s;
+  document.getElementById("rpDist").textContent=fmtNum(s.tiles||0)+" t";
+  document.getElementById("rpEta").textContent=(+(s.eta_seconds||0)).toFixed(1)+" s";
+  document.getElementById("rpSteps").textContent=fmtNum(s.walk_steps||0);
+  document.getElementById("rpHops").textContent=s.shortcut_hops||0;
+  document.getElementById("rpGold").textContent=(s.gold_cost||0)+" gp";
+  document.getElementById("pathHint").innerHTML="Route planned. Click again to reset the <b>start</b> pin.";
+}
+function clearPath(){
+  path.start=null;path.end=null;path.waypoints=[];path.report=null;
+  ["rpDist","rpEta","rpSteps","rpHops","rpGold"].forEach(id=>document.getElementById(id).textContent="—");
+  document.getElementById("pathHint").innerHTML="Click the map to drop a <b>start</b> pin.";
+}
+
+canvas.addEventListener("click",e=>{
+  if(MODE!=="path")return;
+  const r=canvas.getBoundingClientRect();
+  const w=screenToWorld(e.clientX-r.left,e.clientY-r.top);
+  if(!path.start||path.report){clearPath();path.start=w;document.getElementById("pathHint").innerHTML="Now click to drop the <b>end</b> pin.";}
+  else if(!path.end){path.end=w;computePath();}
+});
+
+/* =====================================================================
+   COMMANDS + LIVE SIM
+   ===================================================================== */
+function toast(kind,msg,dur=2200){
+  const t=document.createElement("div");t.className="toast "+kind;
+  t.innerHTML=`<span class="led"></span>${msg}`;
+  document.getElementById("toasts").appendChild(t);
+  setTimeout(()=>{t.style.transition="opacity .3s";t.style.opacity="0";setTimeout(()=>t.remove(),300);},dur);
+}
+function commandStart(){
+  const s=clampInt(getScouts(),0,STATE.pool_size), w=clampInt(getWanderers(),0,STATE.pool_size-s);
+  if(s+w===0){ toast("warn","set at least 1 scout or wanderer"); return; }
+  // in-flight feedback; bots appear via the next /state.json poll (login takes a moment)
+  document.querySelectorAll("#btnLaunch,#btnStart").forEach(b=>{b.dataset.orig=b.innerHTML;b.disabled=true;b.classList.add("ghost");b.innerHTML=`<span class="sp"></span> Starting…`;});
+  fetch(`/command?action=start&scouts=${s}&wanderers=${w}`,{cache:"no-store"})
+    .then(r=>r.json())
+    .then(j=>toast(j.error?"warn":"ok", j.error||`launching ${s} scout(s), ${w} wanderer(s)…`))
+    .catch(()=>toast("warn","start command failed"))
+    .finally(()=>setTimeout(()=>document.querySelectorAll("#btnLaunch,#btnStart").forEach(b=>{if(b.dataset.orig)b.innerHTML=b.dataset.orig;b.classList.remove("ghost");b.disabled=false;}),1400));
+}
+function commandStop(){
+  const b=document.getElementById("btnStop");b.disabled=true;b.innerHTML='<span class="sp"></span> Stopping…';
+  fetch("/command?action=stop",{cache:"no-store"})
+    .then(r=>r.json()).then(j=>toast("warn", j.error||"stopping all bots…"))
+    .catch(()=>toast("warn","stop failed"))
+    .finally(()=>setTimeout(()=>{b.innerHTML='■ Stop';},1200));
+}
+function commandReset(){
+  fetch("/command?action=reset",{cache:"no-store"})
+    .then(r=>r.json()).then(j=>toast(j.error?"warn":"ok", j.error||"resetting bots to temple…"))
+    .catch(()=>toast("warn","reset failed"));
+}
+/* connection + running state, driven by the live poll (not a manual toggle) */
+function setConnected(on){
+  document.body.classList.toggle("disconnected",!on);
+  const c=document.getElementById("conn"); c.classList.toggle("live",on); c.classList.toggle("down",!on);
+  document.getElementById("connTxt").textContent=on?"LIVE":"DISCONNECTED";
+}
+function syncRunningUI(){
+  const running=STATE.bots.length>0;
+  document.body.classList.toggle("empty-run",!running);
+  document.getElementById("emptyState").classList.toggle("hidden",running);
+  document.getElementById("btnStop").disabled=!running;
+  document.getElementById("btnReset").disabled=!running;
+  const startBtn=document.getElementById("btnStart");
+  if(!startBtn.classList.contains("ghost")) startBtn.disabled=false;  // can always add more
+  const rs=document.getElementById("runStatus");
+  rs.innerHTML=running
+    ?`<span class="led" style="background:var(--accent);box-shadow:0 0 8px var(--accent)"></span> ${STATE.manager||"running"}`
+    :`<span class="led" style="background:var(--tx-faint)"></span> ${STATE.manager||"manager idle"}`;
+}
+let controlsSeeded=false;
+function seedControlsFromPool(){
+  if(controlsSeeded) return; controlsSeeded=true;
+  ["inScouts","inScouts2"].forEach(id=>{const e=document.getElementById(id); if(e)e.value=STATE.default_scouts;});
+  ["inWanderers","inWanderers2"].forEach(id=>{const e=document.getElementById(id); if(e)e.value=STATE.default_wanderers;});
+  const p=STATE.pool_size; const pt=document.getElementById("poolTxt"),pt2=document.getElementById("poolTxt2");
+  if(pt)pt.textContent=p; if(pt2)pt2.textContent=p;
+}
+function clampInt(v,lo,hi){v=Math.round(+v||0);return Math.max(lo,Math.min(hi,v));}
+function getScouts(){return +document.getElementById("inScouts").value||0;}
+function getWanderers(){return +document.getElementById("inWanderers").value||0;}
+
+/* Block inspector data. Only fetched while the overlay is on, and only for the followed
+   bot (the categories are per-bot). Kept out of the main poll so the hot path is
+   untouched when debugging is off. */
+async function fetchBlocks(){
+  if(!showBlocks||blocksInFlight){ if(!showBlocks)BLOCKS=null; return; }
+  blocksInFlight=true;
+  try{
+    const foc=STATE.focus?"&focus="+encodeURIComponent(STATE.focus):"";
+    BLOCKS=await (await fetch("/debug.json?r=70"+foc,{cache:"no-store"})).json();
+    updateBlockLegend();
+  }catch(e){ /* transient; keep the last frame */ }
+  blocksInFlight=false;
+}
+function updateBlockLegend(){
+  const el=document.getElementById("blockLegend");
+  if(!el)return;
+  if(!showBlocks||!BLOCKS){ el.style.display="none"; return; }
+  el.style.display="";
+  const c=BLOCKS.counts||{};
+  el.innerHTML=Object.keys(BLOCK_STYLE).map(k=>
+    `<div class="blrow"><span class="blsw" style="background:${BLOCK_STYLE[k].c}"></span>`+
+    `${BLOCK_STYLE[k].label} <b>${c[k]||0}</b></div>`).join("")
+    +`<div class="blrow" style="opacity:.6;margin-top:3px">bot: ${BLOCKS.focus||"—"} · z ${BLOCKS.floor}</div>`;
+}
+
+/* real 400ms poll — fetch /state.json and render it */
+let _polling=false;
+async function pollTick(){
+  if(_polling)return; _polling=true;
+  let s;
+  try{
+    const foc = STATE.focus ? "?focus="+encodeURIComponent(STATE.focus) : "";
+    s = await (await fetch("/state.json"+foc,{cache:"no-store"})).json();
+  }catch(e){ setConnected(false); _polling=false; return; }
+  setConnected(true);
+  const prevRoster = STATE.bots.map(b=>b.name).sort().join("|");
+  STATE.bots=s.bots||[]; STATE.events=s.events||[];
+  STATE.explored_total=s.explored_total||0; STATE.manager=s.manager||"idle";
+  if(s.pool_size!=null)STATE.pool_size=s.pool_size;
+  if(s.default_scouts!=null)STATE.default_scouts=s.default_scouts;
+  if(s.default_wanderers!=null)STATE.default_wanderers=s.default_wanderers;
+  // floor + tiles follow the swarm unless we're manually browsing a floor
+  if(floorOverride==null && s.floor!=null){ STATE.floor=s.floor; STATE.tiles=s.tiles||[]; }
+  STATE.creatures=s.creatures||[];
+  if(STATE.focus && !STATE.bots.some(b=>b.name===STATE.focus)) STATE.focus=null;
+  if(!firstFit && activeTiles().length){ firstFit=true; fitView(); }
+  const f=STATE.bots.find(x=>x.name===STATE.focus);
+  if(f&&MODE==="normal"&&floorOverride==null){ view.cxWorld+=(f.x-view.cxWorld)*0.25; view.cyWorld+=(f.y-view.cyWorld)*0.25; }
+  seedControlsFromPool(); syncRunningUI();
+  fetchBlocks();
+  document.getElementById("teExplored").innerHTML=fmtNum(STATE.explored_total)+"<small> tiles</small>";
+  // Bots with a goal but no route to it. Surfaced up here because it's the difference
+  // between "quietly working" and "burning the session on an impossible target", and
+  // that shouldn't require spotting a marker on a 9,000-tile map.
+  const nStuck=STATE.bots.filter(b=>b.stuck).length;
+  document.getElementById("teStuckWrap").style.display=nStuck?"":"none";
+  document.getElementById("teStuck").textContent=nStuck;
+  document.getElementById("teFloor").textContent="z "+STATE.floor;
+  document.getElementById("hudFloor").textContent="z "+STATE.floor;
+  if(MODE!=="replay"){
+    const roster=STATE.bots.map(b=>b.name).sort().join("|");
+    if(roster!==prevRoster) renderBots(); else refreshBotsLight();  // full re-render only when the roster changes
+    renderEvents(); renderDetail();
+  }
+  _polling=false;
+}
+/* cheap in-place HP/status refresh to avoid full re-render churn */
+function refreshBotsLight(){
+  document.querySelectorAll("#botsList .bot").forEach(el=>{
+    const b=STATE.bots.find(x=>x.name===el.dataset.bot);if(!b)return;
+    const bar=el.querySelector(".hpbar i");if(bar){bar.style.width=b.hp_percent+"%";bar.style.background=hpColor(b.hp_percent);}
+    const n=el.querySelector(".hp-n");if(n)n.textContent=b.hp_percent+"%";
+    const st=el.querySelector(".st");if(st)st.innerHTML=`${b.stuck?'<span style="color:var(--red)">no route to '+b.goal.slice(0,2).join(',')+'</span>':b.status} <span class="lvl">· lv ${b.level}</span>`;
+  });
+}
+
+
+/* =====================================================================
+   WIRING
+   ===================================================================== */
+function bindSteppers(){
+  document.querySelectorAll("[data-step]").forEach(btn=>btn.onclick=()=>{
+    const [field,delta]=btn.dataset.step.split(":");
+    const ids=field==="scouts"?["inScouts","inScouts2"]:["inWanderers","inWanderers2"];
+    let v=clampInt(+document.getElementById(ids[0]).value+(+delta),0,STATE.pool_size);
+    // enforce combined cap vs pool
+    const other=field==="scouts"?(+document.getElementById("inWanderers").value||0):(+document.getElementById("inScouts").value||0);
+    v=Math.min(v,STATE.pool_size-other);
+    ids.forEach(id=>{const el=document.getElementById(id);if(el)el.value=v;});
+  });
+  ["inScouts","inWanderers"].forEach(id=>{
+    const el=document.getElementById(id);if(!el)return;
+    el.oninput=()=>{const m=id==="inScouts"?"inScouts2":"inWanderers2";const o=document.getElementById(m);if(o)o.value=el.value;};
+  });
+  document.querySelectorAll("[data-spd]").forEach(b=>b.onclick=()=>{
+    const el=document.getElementById("inSpeed");el.value=Math.max(20,(parseInt(el.value)||200)+(+b.dataset.spd)*20);computePath();
+  });
+  document.getElementById("inSpeed").oninput=computePath;
+}
+
+async function initReplayUI(){
+  const sel=document.getElementById("recSelect");
+  try{ RECS=(await (await fetch("/recordings",{cache:"no-store"})).json()).recordings||[]; }catch(e){ RECS=[]; }
+  if(!RECS.length){ sel.innerHTML='<option value="">(no recordings yet)</option>'; }
+  else sel.innerHTML=RECS.map(r=>`<option value="${r.file}">${r.bot} · ${fmtStart(r.start)} · ${Math.round(r.duration)}s${r.trigger?(" · "+r.trigger):""}</option>`).join("");
+  sel.onchange=()=>{ if(sel.value) loadRecording(sel.value); };
+  document.getElementById("playBtn").onclick=()=>{if(!REC)return;if(replay.t>=REC.duration)replay.t=0;replay.playing=!replay.playing;lastTs=performance.now();setPlayIcon();};
+  document.getElementById("rwBtn").onclick=()=>{replay.t=Math.max(0,replay.t-5);afterSeek();};
+  document.getElementById("ffBtn").onclick=()=>{replay.t=Math.min(REC?REC.duration:0,replay.t+5);afterSeek();};
+  document.getElementById("seek").oninput=e=>{if(!REC)return;replay.t=e.target.value/1000*REC.duration;afterSeek();};
+  document.getElementById("speedSel").querySelectorAll("button").forEach(b=>b.onclick=()=>{
+    replay.speed=+b.dataset.sp;document.querySelectorAll("#speedSel button").forEach(x=>x.classList.toggle("on",x===b));
+  });
+  // draw seek markers for events
+}
+
+function init(){
+  resizeCanvas();fitView();
+  // modes
+  document.querySelectorAll("#modes button").forEach(b=>b.onclick=()=>setMode(b.dataset.mode));
+  // commands
+  document.getElementById("btnLaunch").onclick=commandStart;
+  document.getElementById("btnStart").onclick=commandStart;
+  document.getElementById("btnStop").onclick=commandStop;
+  document.getElementById("btnReset").onclick=commandReset;
+  document.getElementById("btnClearPath").onclick=clearPath;
+  bindSteppers();initReplayUI();
+  // search + density + scale
+  document.getElementById("botSearch").oninput=e=>{search=e.target.value;renderBots();};
+  document.getElementById("densitySeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{
+    densityMode=b.dataset.d;document.querySelectorAll("#densitySeg button").forEach(x=>x.classList.toggle("on",x===b));renderBots();
+  });
+  // events filter
+  document.querySelectorAll("#evTools .chip").forEach(c=>c.onclick=()=>{
+    sevFilter=c.dataset.sev;document.querySelectorAll("#evTools .chip").forEach(x=>x.classList.toggle("on",x===c));renderEvents();
+  });
+  // floor
+  document.getElementById("flrUp").onclick=()=>changeFloor(-1);
+  document.getElementById("flrDn").onclick=()=>changeFloor(1);
+  // map tools
+  document.getElementById("btnFit").onclick=()=>{
+    if(floorOverride!=null){ floorOverride=null; document.getElementById("hudMode").querySelector("span").textContent=MODE==="normal"?"LIVE":MODE.toUpperCase(); }
+    view.userZoom=1; fitView();
+  };
+  document.getElementById("btnZin").onclick=()=>view.userZoom=Math.min(6,view.userZoom*1.25);
+  document.getElementById("btnZout").onclick=()=>view.userZoom=Math.max(0.4,view.userZoom/1.25);
+  document.getElementById("btnHeat").onclick=e=>{showHeat=!showHeat;e.currentTarget.classList.toggle("on",showHeat);toast("ok",showHeat?"coverage heatmap (planned) — preview on":"heatmap off");};
+  document.getElementById("btnIntent").onclick=e=>{showIntent=!showIntent;e.currentTarget.classList.toggle("on",showIntent);toast("ok",showIntent?"intent overlay on — ring = goal, red ✕ = no route to it":"intent overlay off");};
+  document.getElementById("btnBlocks").onclick=e=>{showBlocks=!showBlocks;e.currentTarget.classList.toggle("on",showBlocks);if(!showBlocks){BLOCKS=null;updateBlockLegend();}else{fetchBlocks();}toast("ok",showBlocks?"block inspector on — follow a bot to see its blocked-tile types":"block inspector off");};
+  document.getElementById("btnCreat").onclick=e=>{showCreaturesLive=!showCreaturesLive;e.currentTarget.classList.toggle("on",showCreaturesLive);toast("ok",showCreaturesLive?"creatures on — red=monster, blue=NPC, pale=player":"creatures hidden");};
+  // connection state is driven by the live poll (setConnected), not a manual toggle
+  document.getElementById("conn").title="";
+  // wheel zoom on map
+  wrap.addEventListener("wheel",e=>{e.preventDefault();view.userZoom=Math.max(0.4,Math.min(6,view.userZoom*(e.deltaY<0?1.1:0.9)));},{passive:false});
+
+  window.addEventListener("resize",()=>{resizeCanvas();fitView();});
+  // The canvas backing store only tracked WINDOW resizes, so anything that resized the
+  // map pane on its own left canvas.width != its CSS width and the browser stretched
+  // the whole map (measured 309 backing vs 374 css). Watch the element itself.
+  if(window.ResizeObserver){
+    new ResizeObserver(()=>{resizeCanvas();fitView();}).observe(wrap);
+  }
+  renderBots(); renderEvents();          // show empty states until the first poll lands
+  requestAnimationFrame(draw);
+  requestAnimationFrame(replayTick);
+  setInterval(pollTick,400);
+  setInterval(tickClock,1000);tickClock();
+}
+async function changeFloor(d){
+  const base=floorOverride!=null?floorOverride:STATE.floor;
+  const z=Math.max(0,Math.min(15,base+d));
+  floorOverride=z; STATE.floor=z;
+  document.getElementById("teFloor").textContent="z "+z;
+  document.getElementById("hudFloor").textContent="z "+z;
+  document.getElementById("hudMode").querySelector("span").textContent="BROWSE";
+  try{ const m=await (await fetch("/map?z="+z,{cache:"no-store"})).json(); STATE.tiles=m.tiles||[]; }catch(e){ STATE.tiles=[]; }
+  view.userZoom=1; fitView();
+  toast("ok","browsing floor z"+z+" — click a bot or ⤢ to return to live");
+}
+function tickClock(){const d=new Date();document.getElementById("clock").textContent=d.toTimeString().slice(0,8);}
+
+init();
+</script>
+</body>
+</html>

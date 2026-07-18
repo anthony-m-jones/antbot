@@ -1,0 +1,683 @@
+"""Navigation — Phase B. Walkability and A* pathfinding over the parsed map.
+
+This turns the sparse tile map that `world.py` builds (state.tiles) into routes
+the bot can actually walk. B1 (this file) plans a path across the *currently
+known* area — the ~18x14 window we parsed at login. B2/B3 will keep that map live
+as the bot moves and let goals sit beyond the current view.
+
+COORDINATES AND DIRECTIONS
+Tibia's axes: +x is east, +y is *south* (y increases downward), z is the floor.
+So the four cardinal steps map to coordinate deltas as below, and the names match
+`client.DIRECTION_OPCODES` so a planned path can be handed straight to the walker.
+"""
+
+from __future__ import annotations
+
+import heapq
+import logging
+
+from .items import ItemFlags
+from .world import GameState, tile_ids
+
+log = logging.getLogger("antbot")
+
+# (name, dx, dy) for the four cardinal steps. Names match DIRECTION_OPCODES.
+# north = y-1, south = y+1, east = x+1, west = x-1.
+_STEPS: list[tuple[str, int, int]] = [
+    ("north", 0, -1),
+    ("east", 1, 0),
+    ("south", 0, 1),
+    ("west", -1, 0),
+]
+
+
+# Ground speed we assume when a tile's ground declares no `bank` (ramps and stairs are
+# the usual case). Pessimistic on purpose: guessing "fast" would make the planner favour
+# exactly the tiles it knows least about.
+DEFAULT_GROUND_SPEED = 150
+# The quickest ground in the game (stone tile / wooden floor / road = 100). Used to keep
+# the A* heuristic admissible once steps cost real time: the cheapest a step can ever be.
+MIN_GROUND_SPEED = 100
+
+
+def tile_cost(state: GameState, item_flags: ItemFlags, x: int, y: int, z: int) -> int:
+    """What it COSTS to step onto (x, y, z) — Tibia's `groundSpeed` for its ground.
+
+    Beware the inversion: groundSpeed is a DURATION, not a speed. The server computes a
+    step as `groundSpeed * 1000 / playerSpeed` ms, so BIGGER means SLOWER. A road is 100,
+    grass 150, sand 160, ocean floor 250 — walking a sand dune costs 60% more time than
+    the road beside it.
+
+    Planning with this instead of "every step costs 1" is what makes bots use the roads.
+    That matters most for EXPLORING: a scout's budget is time, not steps, so preferring
+    fast ground means more tiles revealed per minute — and it naturally sequences the
+    work, mapping a town's streets before wandering off into the countryside, because
+    the cheap frontiers are all on the fast ground.
+
+    The ground is the tile's bottom item; anything above it (a wall, a rug, a pile of
+    loot) doesn't change what the floor costs to cross.
+    """
+    items = state.tiles.get((x, y, z))
+    if not items:
+        return DEFAULT_GROUND_SPEED
+    speed = item_flags.ground_speed(items[0][0])
+    return speed if speed else DEFAULT_GROUND_SPEED
+
+
+def is_walkable(state: GameState, item_flags: ItemFlags, x: int, y: int, z: int,
+                ignore_blocked: bool = False) -> bool:
+    """Can the bot stand on tile (x, y, z), based on what we've parsed?
+
+    A tile is walkable if we know it has contents (so it has a ground tile — void
+    we've never seen is treated as not walkable) and none of its items carry the
+    `unpass` blocking flag (walls, closed doors, rocks, water edges, ...).
+
+    Note this does not consider creatures — the pathfinder handles those
+    separately, so callers can reason about terrain and occupancy independently.
+
+    `ignore_blocked=True` skips the transient `blocked_tiles` layer and judges TERRAIN
+    only. The break-out maneuver uses this: when a scout has walled itself in with
+    blocked tiles (many of them stale — other bots that have since moved), it must be
+    able to ask "is this a real wall, or just something we blocked earlier?" and try
+    stepping onto the latter.
+    """
+    if not ignore_blocked and (x, y, z) in state.blocked_tiles:
+        return False  # the server refused this tile before; don't retry it
+    items = state.tiles.get((x, y, z))
+    if not items:
+        return False  # unknown / void: no ground to stand on
+    # Impassable liquid ground (open water / lava). The ground is the bottom of the
+    # stack; appearances.dat doesn't reliably flag these `unpass`, so without this a
+    # bot treats the sea as walkable and floods across it (peninsula stuck-loop).
+    # Tiles are [(id, count), ...] — walkability only ever cares about the ids.
+    if items[0][0] in getattr(item_flags, "impassable_ground", ()):
+        return False
+    return not any(item_flags.is_blocking(item_id) for item_id, _ in items)
+
+
+def has_standable_neighbour(state: GameState, item_flags: ItemFlags,
+                            tile: tuple[int, int, int]) -> bool:
+    """Could a bot ever stand close enough to touch `tile`?
+
+    Picking something up needs range 1 (Chebyshev — diagonals count), so a pile is only
+    ever fetchable if the tile itself or one of its eight neighbours is standable. Loot
+    walled inside scenery — the crystal coins behind the Thais bank counter, say — has
+    no standable tile anywhere around it and can NEVER be collected. It is map
+    decoration wearing a price tag.
+
+    This matters because such a pile is worse than useless to the loot map: our scorer
+    ranks by value, so a decorative pile of crystal coins outranks every real pile in
+    town and haulers queue up to fail on it forever.
+
+    Deliberately LOCAL: it only looks at the eight neighbours, all of which the bot saw
+    in the same view as the pile itself. So it never confuses "unreachable" with "we
+    haven't explored the way there yet" — the mistake a route-based test would make on
+    a half-explored map. A tile we've never seen doesn't count as standable, which is
+    the safe direction: it just means we don't judge until we've looked.
+    """
+    x, y, z = tile
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            if is_walkable(state, item_flags, x + dx, y + dy, z, ignore_blocked=True):
+                return True
+    return False
+
+
+def find_path(state: GameState, item_flags: ItemFlags,
+              goal_x: int, goal_y: int) -> list[str] | None:
+    """A* from our current position to (goal_x, goal_y) on the same floor.
+
+    Returns the list of step directions to walk (e.g. ["north", "north", "east"]),
+    an empty list if we are already there, or None if no route exists within the
+    known map. Same-floor only for B1 — stairs/ramps come with floor handling
+    later.
+
+    Creatures block: we won't route *through* a tile occupied by another
+    creature, though the goal tile itself is allowed to be occupied (you might be
+    pathing toward one).
+    """
+    if state.position is None:
+        return None
+    z = state.position.z
+    start = (state.position.x, state.position.y)
+    goal = (goal_x, goal_y)
+
+    if start == goal:
+        return []
+
+    # Tiles occupied by other creatures — treated as blocked (except the goal).
+    occupied = {
+        (c.position.x, c.position.y)
+        for c in state.nearby_creatures()
+        if c.position is not None and c.position.z == z
+    }
+
+    # The goal must be reachable terrain, otherwise there's nothing to plan to.
+    if not is_walkable(state, item_flags, goal_x, goal_y, z):
+        log.debug("goal (%d, %d, %d) is not walkable terrain", goal_x, goal_y, z)
+        return None
+
+    def heuristic(node: tuple[int, int]) -> int:
+        # Manhattan distance, priced at the FASTEST ground in the game. Steps now cost
+        # real time (see tile_cost), so the estimate has to be in the same units as g —
+        # and it must never overstate the true remaining cost or A* can return a
+        # non-optimal path. No route can beat MIN_GROUND_SPEED per step, so this is the
+        # tightest admissible bound available.
+        return (abs(node[0] - goal[0]) + abs(node[1] - goal[1])) * MIN_GROUND_SPEED
+
+    # Standard A*. open_heap entries are (f_score, g_score, node).
+    open_heap: list[tuple[int, int, tuple[int, int]]] = [(heuristic(start), 0, start)]
+    # For each reached node, remember (previous_node, direction_taken) to rebuild.
+    came_from: dict[tuple[int, int], tuple[tuple[int, int], str]] = {}
+    best_g: dict[tuple[int, int], int] = {start: 0}
+
+    while open_heap:
+        _, g, current = heapq.heappop(open_heap)
+        if current == goal:
+            return _reconstruct(came_from, current)
+        if g > best_g.get(current, g):
+            continue  # a better path to `current` was already processed
+        for name, dx, dy in _STEPS:
+            neighbor = (current[0] + dx, current[1] + dy)
+            if neighbor != goal:
+                if not is_walkable(state, item_flags, neighbor[0], neighbor[1], z):
+                    continue
+                if neighbor in occupied:
+                    continue
+            tentative = g + tile_cost(state, item_flags, neighbor[0], neighbor[1], z)
+            if tentative < best_g.get(neighbor, 1 << 30):
+                best_g[neighbor] = tentative
+                came_from[neighbor] = (current, name)
+                heapq.heappush(open_heap, (tentative + heuristic(neighbor), tentative, neighbor))
+
+    return None  # exhausted the known area without reaching the goal
+
+
+def find_frontier(state: GameState, item_flags: ItemFlags,
+                  max_search: int = 8000,
+                  center: tuple[int, int] | None = None,
+                  radius: int | None = None,
+                  skip: set[tuple[int, int]] | None = None) -> tuple[int, int] | None:
+    """Find the walkable tile that borders UNEXPLORED space and is QUICKEST to reach.
+
+    This is what makes exploration purposeful instead of random: it flood-fills the
+    known walkable area from our position and returns the closest tile that has a
+    neighbour we've NEVER SEEN (a slot not in `state.seen` — as opposed to a wall or
+    open air over a cliff, both of which we HAVE seen: the wall is a blocking tile, the
+    void is a slot the server described as empty). Testing against `seen` rather than
+    `state.tiles` is what stops a scout running a ledge forever, mistaking the open air
+    past it for unexplored land. Walking to a real frontier reveals new map; the next
+    frontier is further out, so the mapped region steadily expands outward.
+
+    "Closest" means closest in TIME, not in tiles: the flood is a Dijkstra weighted by
+    `tile_cost`, so the frontier we pick is the one we can actually get to soonest. A
+    scout's budget is time, so this straightforwardly buys more map per minute. It also
+    ORDERS the work the way you'd want by itself — road frontiers are cheap and get
+    taken first, so a town's streets fill in before anyone wanders off across the
+    fields, and the slow off-road frontiers are left until the fast ones run out. No
+    explicit "do towns first" rule needed; it falls out of costing time honestly.
+
+    Two modes:
+      - Scout (center=None): flood the whole reachable floor, capped at
+        `max_search` tiles. Returns the globally-nearest frontier so scouts range
+        outward without bound.
+      - Wanderer (center + radius given): only consider — and only flood toward —
+        tiles within `radius` Manhattan of `center` (the bot's home/temple). This
+        keeps the colony clustered near spawn AND bounds the search to a small box,
+        so it stays cheap even after the bot has accumulated a huge tile map. When
+        the home box is fully mapped it returns None, and the caller falls back to
+        idle milling.
+
+    Returns the (x, y) of that frontier tile on the current floor, or None if the
+    reachable (and, for a wanderer, in-bounds) area is fully mapped.
+    """
+    if state.position is None:
+        return None
+    z = state.position.z
+    start = (state.position.x, state.position.y)
+
+    def within(pt: tuple[int, int]) -> bool:
+        # No bound for scouts; a Manhattan box around home for wanderers.
+        if center is None or radius is None:
+            return True
+        return abs(pt[0] - center[0]) + abs(pt[1] - center[1]) <= radius
+
+    skip = skip or set()
+    # Dijkstra over travel TIME (see tile_cost), so the first frontier we pop is the one
+    # reachable soonest — not merely the one fewest tiles away. With a uniform cost this
+    # degenerates to the breadth-first search it replaced.
+    best_cost: dict[tuple[int, int], int] = {start: 0}
+    heap: list[tuple[int, tuple[int, int]]] = [(0, start)]
+    settled: set[tuple[int, int]] = set()
+    while heap and len(settled) < max_search:
+        cost, (cx, cy) = heapq.heappop(heap)
+        if (cx, cy) in settled:
+            continue
+        settled.add((cx, cy))
+        # Is this a frontier tile — does it touch anything unseen? (Only tiles that
+        # are themselves in-bounds count, so a wanderer doesn't get lured outward;
+        # and not one the caller has ruled out as unreachable-in-practice via `skip`.)
+        if within((cx, cy)) and (cx, cy) not in skip:
+            for _name, dx, dy in _STEPS:
+                if (cx + dx, cy + dy, z) not in state.seen:
+                    return (cx, cy)
+        # Otherwise keep flooding over walkable neighbours, but never expand past
+        # the bound — that's what both keeps wanderers home and caps the work.
+        for _name, dx, dy in _STEPS:
+            nxt = (cx + dx, cy + dy)
+            if nxt in settled or not within(nxt):
+                continue
+            if not is_walkable(state, item_flags, nxt[0], nxt[1], z):
+                continue
+            nd = cost + tile_cost(state, item_flags, nxt[0], nxt[1], z)
+            if nd < best_cost.get(nxt, 1 << 30):
+                best_cost[nxt] = nd
+                heapq.heappush(heap, (nd, nxt))
+    return None
+
+
+def find_path_toward(state: GameState, item_flags: ItemFlags,
+                     goal_x: int, goal_y: int,
+                     max_radius: int | None = None) -> list[str] | None:
+    """Path *toward* (goal_x, goal_y), even if it's beyond what we've seen.
+
+    This is what makes `goto` work across screens (B3). The goal tile usually
+    isn't in the known map yet, so exact A* would give up. Instead we flood the
+    known walkable area from our position and head for the reachable tile that
+    gets us *closest* to the goal. Walking there scrolls new map in via the edge
+    slices; the next call floods the now-larger map and gets closer still, and so
+    on until the goal itself becomes reachable.
+
+    `max_radius` bounds the flood to a Manhattan box of that many tiles around our
+    current position. This matters for PERFORMANCE: callers that re-plan every step
+    (the explorer/scout) only ever consume the *first* step of the returned path,
+    so there is no point flooding the entire accumulated tile map — which grows
+    without bound as a bot explores. A local flood of radius ~40 gives more than
+    enough lookahead to route around walls, is self-correcting (we re-plan from the
+    new position each step), and turns per-step planning from O(map) into O(radius²)
+    — the key to running many bots at once. Leave it None (the default) for `goto`
+    /`travel`, which want exact long-distance routing to a specific tile.
+
+    Returns the directions toward that best frontier tile, or None if we can't get
+    any closer (blocked in, or the goal's direction is walled off in known space).
+    """
+    if state.position is None:
+        return None
+    z = state.position.z
+    start = (state.position.x, state.position.y)
+    goal = (goal_x, goal_y)
+
+    occupied = {
+        (c.position.x, c.position.y)
+        for c in state.nearby_creatures()
+        if c.position is not None and c.position.z == z
+    }
+
+    # Dijkstra flood over known walkable tiles, weighted by travel TIME (`tile_cost`),
+    # so the route we hand back prefers roads over sand even when that costs a tile or
+    # two. Track the reachable tile with the smallest Manhattan distance to the goal —
+    # closeness to the goal is still measured in tiles, since the goal is usually beyond
+    # the known map and we have no idea what the ground out there costs. Only the
+    # ROUTE is time-optimal. (With a uniform cost this degenerates to the breadth-first
+    # search it replaced.)
+    came_from: dict[tuple[int, int], tuple[tuple[int, int], str]] = {}
+    best_cost: dict[tuple[int, int], int] = {start: 0}
+    heap: list[tuple[int, tuple[int, int]]] = [(0, start)]
+    settled: set[tuple[int, int]] = set()
+    best = start
+    best_dist = abs(start[0] - goal[0]) + abs(start[1] - goal[1])
+
+    while heap:
+        cost, current = heapq.heappop(heap)
+        if current in settled:
+            continue
+        settled.add(current)
+        distance = abs(current[0] - goal[0]) + abs(current[1] - goal[1])
+        if distance < best_dist:
+            best_dist, best = distance, current
+        if current == goal:
+            best = current
+            break
+        for name, dx, dy in _STEPS:
+            neighbor = (current[0] + dx, current[1] + dy)
+            if neighbor in settled:
+                continue
+            # Bounded flood: never expand past `max_radius` from where we stand.
+            if max_radius is not None and (
+                    abs(neighbor[0] - start[0]) + abs(neighbor[1] - start[1]) > max_radius):
+                continue
+            if not is_walkable(state, item_flags, neighbor[0], neighbor[1], z):
+                continue
+            if neighbor != goal and neighbor in occupied:
+                continue
+            nd = cost + tile_cost(state, item_flags, neighbor[0], neighbor[1], z)
+            if nd < best_cost.get(neighbor, 1 << 30):
+                best_cost[neighbor] = nd
+                came_from[neighbor] = (current, name)
+                heapq.heappush(heap, (nd, neighbor))
+
+    if best == start:
+        return None  # nothing reachable is closer than where we already stand
+    return _reconstruct(came_from, best)
+
+
+def find_use_object(state: GameState, item_flags: ItemFlags, registry,
+                    skip: set[tuple[int, int, int]] | None = None,
+                    max_dist: int | None = None):
+    """Find the nearest tile on our floor carrying a known USE-based object.
+
+    "USE-based" = the traversal registry classifies it into a category whose action
+    is anything other than a plain STEP (ladders, grates, wells, doors, shovel/rope
+    holes). Step-based objects (teleporters/stairs/open holes) are already handled
+    as ordinary walk-onto links, so we skip them here.
+
+    This is how a scout turns the seeded catalog knowledge into actual shortcuts: it
+    walks to one of these objects and uses it (see client `_perform_traversal`),
+    which — if it relocates us — gets recorded as a link the whole colony can route
+    through afterwards.
+
+    Returns `(source, item_id, category, launch, direction)` where `source` is the
+    object's (x, y, z), `launch` is an adjacent walkable tile to stand on, and
+    `direction` is the cardinal name from launch to source; or None if there's no
+    reachable use-object we haven't already ruled out (`skip`). We pick by Manhattan
+    distance and only require a walkable neighbour — the caller does the real
+    navigation, so we keep this scan cheap (no pathfinding per candidate).
+    """
+    if state.position is None:
+        return None
+    skip = skip or set()
+    px, py, z = state.position.x, state.position.y, state.position.z
+
+    # With a small `max_dist` (the scout's per-round on-sight check), scan only the
+    # box around us instead of the whole accumulated tile map — O(max_dist²) rather
+    # than O(map), so it's cheap to run every round even with a huge explored area.
+    if max_dist is not None and max_dist <= 30:
+        candidates = (
+            ((x, y, z), state.tiles.get((x, y, z)))
+            for x in range(px - max_dist, px + max_dist + 1)
+            for y in range(py - max_dist, py + max_dist + 1)
+        )
+        candidates = ((key, items) for key, items in candidates if items)
+    else:
+        candidates = state.tiles.items()
+
+    best = None
+    best_dist = 1 << 30
+    for (x, y, tz), items in candidates:
+        if tz != z or (x, y, tz) in skip:
+            continue
+        hit = registry.classify(tile_ids(items))   # the registry keys on item identity
+        if hit is None:
+            continue
+        category, item_id = hit
+        kind = registry.kind(category)
+        if kind is None or kind.action == "step":   # step objects aren't "used"
+            continue
+        dist = abs(x - px) + abs(y - py)
+        if dist == 0 or dist >= best_dist:
+            continue
+        if max_dist is not None and dist > max_dist:
+            continue   # too far to be worth a detour (caller only wants NEARBY ones)
+        # Need somewhere adjacent and walkable to stand while using it.
+        for name, dx, dy in _STEPS:
+            launch = (x + dx, y + dy)
+            if is_walkable(state, item_flags, launch[0], launch[1], z):
+                # `direction` is launch -> source, i.e. the opposite of this step.
+                opposite = {"north": "south", "south": "north",
+                            "east": "west", "west": "east"}[name]
+                best = ((x, y, z), item_id, category, (launch[0], launch[1], z), opposite)
+                best_dist = dist
+                break
+    return best
+
+
+def find_descent(state: GameState, item_flags: ItemFlags, registry,
+                 skip: set[tuple[int, int, int]] | None = None,
+                 max_dist: int | None = None):
+    """Find the nearest tile on our floor you can WALK ONTO to go down a floor.
+
+    This is the mirror of `find_use_object`, but for the STEP-based *descent* objects:
+    open holes / trapdoors / ladder-holes-down / down-stairs — every category whose
+    kind is `action == "step"` and `direction == "down"`. `find_use_object` explicitly
+    skips step objects (they're normally handled as ordinary walk-onto links), which
+    left a real gap: a scout that climbs UP a ladder has no learned link back down and
+    never deliberately seeks the hole to fall through, so it strands itself on the
+    upper floor. This lets it hunt for that hole on purpose.
+
+    Why we don't just let normal pathfinding walk over the hole: once a bot has fallen
+    through a hole we mark that tile blocked (a hazard), so the planner routes AROUND
+    it forever after. To go down on purpose we must target the hole explicitly and
+    step onto it with `_raw_step` (which ignores the block), which is what the caller
+    does with the `(source, launch, direction)` this returns.
+
+    Returns `(source, item_id, category, launch, direction)` — same shape as
+    `find_use_object`: `source` is the hole's (x, y, z), `launch` an adjacent walkable
+    tile to stand on, `direction` the cardinal name from launch onto the hole; or None
+    if there's no reachable descent tile we haven't already ruled out via `skip`.
+    """
+    if state.position is None:
+        return None
+    skip = skip or set()
+    px, py, z = state.position.x, state.position.y, state.position.z
+
+    # Same cheap box-vs-whole-map scan as find_use_object (see there for the why).
+    if max_dist is not None and max_dist <= 30:
+        candidates = (
+            ((x, y, z), state.tiles.get((x, y, z)))
+            for x in range(px - max_dist, px + max_dist + 1)
+            for y in range(py - max_dist, py + max_dist + 1)
+        )
+        candidates = ((key, items) for key, items in candidates if items)
+    else:
+        candidates = state.tiles.items()
+
+    best = None
+    best_dist = 1 << 30
+    for (x, y, tz), items in candidates:
+        if tz != z or (x, y, tz) in skip:
+            continue
+        hit = registry.classify(tile_ids(items))   # the registry keys on item identity
+        if hit is None:
+            continue
+        category, item_id = hit
+        kind = registry.kind(category)
+        # Only STEP-down objects: a hole/trapdoor/down-stair you fall through by
+        # stepping onto it. USE objects (ladders up, grates) belong to
+        # find_use_object; up-stairs and teleporters go the wrong way for a descent.
+        if kind is None or kind.action != "step" or kind.direction != "down":
+            continue
+        dist = abs(x - px) + abs(y - py)
+        if dist == 0 or dist >= best_dist:
+            continue
+        if max_dist is not None and dist > max_dist:
+            continue
+        for name, dx, dy in _STEPS:
+            launch = (x + dx, y + dy)
+            if is_walkable(state, item_flags, launch[0], launch[1], z):
+                opposite = {"north": "south", "south": "north",
+                            "east": "west", "west": "east"}[name]
+                best = ((x, y, z), item_id, category, (launch[0], launch[1], z), opposite)
+                best_dist = dist
+                break
+    return best
+
+
+def _reconstruct(came_from: dict[tuple[int, int], tuple[tuple[int, int], str]],
+                 node: tuple[int, int]) -> list[str]:
+    """Walk the came_from chain back to the start, yielding directions in order."""
+    directions: list[str] = []
+    while node in came_from:
+        prev, name = came_from[node]
+        directions.append(name)
+        node = prev
+    directions.reverse()
+    return directions
+
+
+def within_reach(node: tuple[int, int, int], goal: tuple[int, int, int],
+                 reach: int) -> bool:
+    """Is `node` close enough to `goal` to act on it?
+
+    Chebyshev distance on the same floor, because that's the server's own rule for
+    reaching a thing: diagonals count, so the eight tiles around an object are all
+    "range 1". `reach=0` means standing exactly on it.
+    """
+    return (node[2] == goal[2]
+            and max(abs(node[0] - goal[0]), abs(node[1] - goal[1])) <= reach)
+
+
+def find_route(walkable: set[tuple[int, int, int]],
+               links: dict[tuple[int, int, int], tuple[int, int, int]],
+               start: tuple[int, int, int],
+               goal: tuple[int, int, int],
+               reach: int = 0,
+               avoid: set[tuple[int, int, int]] | None = None,
+               costs: dict[tuple[int, int, int], int] | None = None,
+               ) -> list[tuple[str, bool, tuple[int, int, int]]] | None:
+    """Route across the *whole known world*, using teleports/stairs as shortcuts.
+
+    Unlike `find_path` (single floor, on-foot only), this searches the colony's
+    entire shared walkable map plus the learned links, so a far goal on another
+    floor or in another region is reachable by stepping through a teleport. Nodes
+    are absolute (x, y, z); edges are:
+      - a cardinal step to an adjacent walkable tile (cost 1), and
+      - stepping onto a link source tile, which lands you at its destination
+        (cost 1) — the teleport/stairs used as a highway.
+
+    We use Dijkstra rather than A*: a teleport can make the true distance far
+    shorter than the Manhattan estimate, which would make an A* heuristic
+    inadmissible (and its routes wrong). Dijkstra needs no heuristic. (For very
+    large maps this is where a hierarchical, Google-Maps-style approach would come
+    in later; for the sizes we explore now it's fine.)
+
+    `reach` stops at any tile within that Chebyshev distance of `goal` instead of on
+    it. This is what makes the router usable for OBJECTS rather than destinations: a
+    locker, a wall lever or a loot pile under a blocking item is not itself walkable,
+    so an exact-goal search returns None even when the bot could plainly walk up and
+    touch it. Interacting only needs range 1 anyway.
+
+    `avoid` is never entered — learned hazards and tiles the server has refused us.
+    The shared walkable map only ever GROWS (a tile that looked walkable stays in it),
+    so this is how a bot keeps its hard-won local knowledge from being overruled.
+
+    `costs` prices each tile in travel time (`tile_cost` / the colony's walk costs), so
+    routes prefer the road. Omit it and every step costs the same, which is the old
+    fewest-tiles behaviour. A teleport hop is priced at the cheapest possible step: it is
+    effectively instant, and must never look worse than walking.
+
+    `start` is always a legal node even if it isn't in `walkable`: we are, self
+    evidently, standing on it, whatever the map believes.
+
+    Returns a list of (direction, is_teleport, resulting_position) steps, or None
+    if the goal isn't reachable through what we've explored. `is_teleport` marks a
+    step where walking `direction` puts you onto a link tile and whisks you to
+    `resulting_position` instead of the adjacent tile.
+    """
+    if within_reach(start, goal, reach):
+        return []
+
+    avoid = avoid or set()
+    dist = {start: 0}
+    prev: dict[tuple[int, int, int], tuple[tuple[int, int, int], str, bool]] = {}
+    heap: list[tuple[int, tuple[int, int, int]]] = [(0, start)]
+    target: tuple[int, int, int] | None = None
+
+    while heap:
+        d, node = heapq.heappop(heap)
+        if within_reach(node, goal, reach):
+            target = node
+            break
+        if d > dist.get(node, 1 << 60):
+            continue
+        x, y, z = node
+        for name, dx, dy in _STEPS:
+            adjacent = (x + dx, y + dy, z)
+            if adjacent in avoid:
+                continue
+            if adjacent in links:
+                # Stepping onto this tile teleports us to its destination.
+                landing, teleport = links[adjacent], True
+            elif adjacent in walkable:
+                landing, teleport = adjacent, False
+            else:
+                continue
+            if landing in avoid:
+                continue
+            # Both branches must be in the SAME units, or the router mis-prices one of
+            # them badly. A teleport is instant, so it costs the cheapest step there is —
+            # never more than walking, or we'd trudge straight past a portal.
+            if costs:
+                step = MIN_GROUND_SPEED if teleport else costs.get(landing, DEFAULT_GROUND_SPEED)
+            else:
+                step = 1        # unpriced: every step equal, the old fewest-tiles rule
+            nd = d + step
+            if nd < dist.get(landing, 1 << 60):
+                dist[landing] = nd
+                prev[landing] = (node, name, teleport)
+                heapq.heappush(heap, (nd, landing))
+
+    if target is None or target not in prev:
+        return None
+
+    route: list[tuple[str, bool, tuple[int, int, int]]] = []
+    node = target
+    while node in prev:
+        came, name, teleport = prev[node]
+        route.append((name, teleport, node))
+        node = came
+    route.reverse()
+    return route
+
+
+# Deltas by direction name, shared with the renderer.
+_DELTAS = {name: (dx, dy) for name, dx, dy in _STEPS}
+
+
+def render_ascii(state: GameState, item_flags: ItemFlags,
+                 path: list[str] | None = None) -> str:
+    """Draw the known area around the bot as text, for eyeballing the parse/plan.
+
+    Legend:
+        @  us            *  a planned path tile      C  another creature
+        .  walkable      #  known but blocked        (space) unknown / not seen
+
+    If `path` is given, the tiles it walks through are marked with '*', so you can
+    literally see the route thread between the walls.
+    """
+    if state.position is None:
+        return "(no position)"
+    px, py, z = state.position.x, state.position.y, state.position.z
+
+    # Project the path into the set of tiles it visits.
+    path_tiles: set[tuple[int, int]] = set()
+    cx, cy = px, py
+    for direction in path or []:
+        dx, dy = _DELTAS[direction]
+        cx, cy = cx + dx, cy + dy
+        path_tiles.add((cx, cy))
+
+    occupied = {
+        (c.position.x, c.position.y)
+        for c in state.nearby_creatures()
+        if c.position is not None and c.position.z == z
+    }
+
+    lines = []
+    for y in range(py - 6, py + 8):
+        row = []
+        for x in range(px - 8, px + 10):
+            if (x, y) == (px, py):
+                ch = "@"
+            elif (x, y) in path_tiles:
+                ch = "*"
+            elif (x, y) in occupied:
+                ch = "C"
+            elif is_walkable(state, item_flags, x, y, z):
+                ch = "."
+            elif (x, y, z) in state.tiles:
+                ch = "#"  # known tile, but something on it blocks
+            else:
+                ch = " "  # never parsed: void or out of window
+            row.append(ch)
+        lines.append("".join(row))
+    return "\n".join(lines)
