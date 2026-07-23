@@ -92,6 +92,11 @@ class NavTest:
     start: tuple[int, int, int]
     dest: tuple[int, int, int]
     time_limit: float
+    # A SECOND leg, tacked on after the bot reaches `dest`: reach `dest`, THEN reach `dest2`,
+    # in the same run. None (the default) is an ordinary one-leg test. Each leg gets its OWN
+    # frozen floor fixture (see run_efficiency) but shares this same `time_limit`, applied
+    # fresh per leg so a slow second leg can't eat into the first leg's budget or vice versa.
+    dest2: tuple[int, int, int] | None = None
     requires: tuple[TileRequire, ...] = ()
     setup: tuple[TileSetup, ...] = ()   # GM tile transforms applied before the run
     # How the bot gets to the start tile:
@@ -184,6 +189,47 @@ TESTS: list[NavTest] = [
         dest=(32389, 32238, 7),
         time_limit=90.0,
         setup=(TileSetup(32388, 32238, 7, 1630, 1629, "close door"),),
+        measure_efficiency=True,
+        cold_budget=None,
+        warm_budget=None,
+    ),
+    # LONG-RANGE case, deliberately ~3x farther than any test above (same start, same
+    # building with the stairs/ladder/door, but the destination is well past the edge of a
+    # single view — a bot standing at `start` cannot see `dest`, or anything near it, at
+    # login). This is the test for a DIFFERENT failure mode than the earlier ones: not
+    # "does it recognize a z-hop object correctly", but "does it grow the shared map as it
+    # goes, and route the SECOND bot over ground the FIRST bot only ever saw in passing".
+    # Same floor both ends (z7) — no climb is forced — so a poor cold_ratio here means the
+    # exploration itself wandered, not that a floor-change decision was wrong; that keeps
+    # this test isolated from the concerns the two tests above already cover. No door setup:
+    # the premise is "open, unmapped ground", not "did we open a specific known obstacle".
+    NavTest(
+        name="Efficiency: long-range trek to a distant grate",
+        start=(32386, 32241, 7),
+        dest=(32385, 32216, 7),
+        time_limit=150.0,
+        measure_efficiency=True,
+        cold_budget=None,
+        warm_budget=None,
+    ),
+    # SECOND LEG tacked onto the test above: same trek to the grate, then a second directed
+    # navigation from ON TOP of the grate straight down to the tile directly below it. The
+    # grate is USE-type (registry: ("grate", USE, DOWN) — see traversal.py), not STEP-type,
+    # so it is never triggered by accident; you have to deliberately use it. IDEALLY leg 2
+    # is a single `_perform_traversal` on the object we're already standing on and the test
+    # finishes almost instantly. But `navigate_to`'s wrong-floor branch (see client.py) only
+    # calls `_try_change_floor` — which hunts STEP-type crossings — never `_try_use_object`,
+    # which is what actually knows how to USE an object. `_try_change_floor`'s own
+    # "standing on it" fallback also only fires for `kind.action == "step"`. So there is a
+    # real, live question here: does the bot notice the grate underfoot at all, or does it
+    # walk off in search of a staircase somewhere else in the revealed region (or get stuck
+    # standing there if none exists)? This test exists to surface that, not assume the answer.
+    NavTest(
+        name="Efficiency: long-range trek, then drop through the grate",
+        start=(32386, 32241, 7),
+        dest=(32385, 32216, 7),
+        dest2=(32385, 32216, 8),
+        time_limit=150.0,
         measure_efficiency=True,
         cold_budget=None,
         warm_budget=None,
@@ -467,9 +513,27 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
     door, which would poison a shared map into thinking the shut door is passable. The
     reported improvement (cold − warm) is thus two independent measurements: explore-from-
     scratch vs route-over-a-known-map.
+
+    LEGS. A test with `dest2` set is really TWO tests chained: reach `dest`, then reach
+    `dest2`, in the SAME session (so leg 2 starts from wherever leg 1 actually left the bot,
+    not a fresh teleport). Everything below is written in terms of a `legs` list — a one-leg
+    test is just the len(legs)==1 case, so the original single-destination behavior (and its
+    fixture file's name) is completely unchanged; only `dest2 is not None` adds a second
+    entry. Each leg gets its OWN frozen floor (its own par_cost, its own revealed region),
+    priced and reported separately, because a two-leg test usually exists precisely to ask
+    "which leg is the problem" — collapsing both into one number would hide that.
     """
+    legs: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = [(test.start, test.dest)]
+    if test.dest2 is not None:
+        legs.append((test.dest, test.dest2))
+    multi = len(legs) > 1
+
     print(f"\n>>> {test.name}  [efficiency: {'+'.join(phases)}]")
-    print(f"    start {test.start} -> dest {test.dest}, limit {test.time_limit:.0f}s/pass")
+    if multi:
+        waypoints = " -> ".join(str(p) for p in (test.start, test.dest, test.dest2))
+        print(f"    {waypoints}, limit {test.time_limit:.0f}s/leg/pass")
+    else:
+        print(f"    start {test.start} -> dest {test.dest}, limit {test.time_limit:.0f}s/pass")
     if not _port_open(HOST, LOGIN_PORT) and not _start_server_and_wait():
         return Result(test.name, "ERROR", "server did not come back up in time")
 
@@ -477,20 +541,34 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
     flags.add_impassable_ground(impassable_ground_ids(load_item_catalog(ITEMS_XML)))
     opens, closes = _door_cmds(test)
 
-    # The frozen floor. Build it once (a ~30s full reveal) if missing or if asked to rebuild.
-    if rebuild_fixture:
-        navfixture.fixture_path(test.name).unlink(missing_ok=True)
-    fixture = navfixture.load(test.name)
-    if fixture is None:
-        print("    no floor fixture yet — revealing the region to compute par_cost ...")
-        fixture = await navfixture.build(flags, test.name, test.start, test.dest,
-                                         opens, closes, CHARACTER, ACCOUNT, PASSWORD,
-                                         host=HOST, login_port=LOGIN_PORT)
-        await asyncio.sleep(3)   # space logins — Canary throttles rapid ones
-    print(f"    floor: par_cost={fixture.par_cost} over {len(fixture.par_path)} tiles")
-    cost_of = fixture.cost_of()
+    # One frozen floor PER LEG. A one-leg test keeps its fixture under `test.name` exactly as
+    # before (so nothing here forces a rebuild of any existing fixture file); a multi-leg test
+    # suffixes each leg's name, so leg 1 and leg 2 never collide. If a leg's (start, dest)
+    # happens to match an EARLIER test's exactly (as our leg 1 does — see the long-range test
+    # above), giving it that same name here makes it transparently reuse that fixture instead
+    # of revealing the same region twice.
+    fixtures: list[navfixture.ParFixture] = []
+    for i, (leg_start, leg_dest) in enumerate(legs):
+        leg_name = test.name if not multi else f"{test.name} :: leg {i + 1}"
+        if rebuild_fixture:
+            navfixture.fixture_path(leg_name).unlink(missing_ok=True)
+        fixture = navfixture.load(leg_name)
+        if fixture is None:
+            print(f"    no floor fixture yet for leg {i + 1} ({leg_start} -> {leg_dest}) — "
+                  "revealing the region to compute par_cost ...")
+            fixture = await navfixture.build(flags, leg_name, leg_start, leg_dest,
+                                             opens, closes, CHARACTER, ACCOUNT, PASSWORD,
+                                             host=HOST, login_port=LOGIN_PORT)
+            await asyncio.sleep(3)   # space logins — Canary throttles rapid ones
+        print(f"    leg {i + 1} floor: par_cost={fixture.par_cost} over "
+              f"{len(fixture.par_path)} tiles")
+        fixtures.append(fixture)
+    cost_of_per_leg = [f.cost_of() for f in fixtures]
+    par_total = sum(f.par_cost for f in fixtures) or 1
 
-    measured: dict[str, tuple[bool, int, list]] = {}   # phase -> (arrived, cost, path)
+    # phase -> per-leg (arrived, cost, path); a failed leg is the LAST entry (we stop there —
+    # there's no honest cost for a leg the bot never got to attempt).
+    measured: dict[str, list[tuple[bool, int, list]]] = {}
 
     async def run_one(phase: str) -> None:
         """Run one phase in its OWN fresh session + colony, so the two never contaminate each
@@ -504,15 +582,19 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
         # traversal registry is still catalog-seeded, so the bot recognizes a ladder/door on
         # sight — that's the rules of the world, not its layout.
         colony = Colony(item_flags=flags, hazard_file=None)
-        # WARM = routing over a KNOWN map: seed the colony with the fully-revealed region from
-        # the fixture, INCLUDING the door tile. The door must stay in the shared graph so the
-        # router plans the SHORT route straight to it (excluding it sends the router hunting a
-        # long way around — even up a floor — which is the wander an earlier version showed).
-        # We instead make the door open correctly by showing it CLOSED in the bot's OWN view
-        # (below): the local walker then stops at the door rather than trying to step through a
-        # tile it wrongly believes is open, and navigate_to's open-the-door branch engages.
+        # WARM = routing over a KNOWN map: seed the colony with EVERY leg's fully-revealed
+        # region, INCLUDING the door tile. seed_for_test is additive/idempotent (see colony.py),
+        # so seeding once per fixture simply tops the colony up to the union of both reveals —
+        # exactly what a bot that already knows the whole two-leg journey would know. The door
+        # must stay in the shared graph so the router plans the SHORT route straight to it
+        # (excluding it sends the router hunting a long way around — even up a floor — which is
+        # the wander an earlier version showed). We instead make the door open correctly by
+        # showing it CLOSED in the bot's OWN view (below): the local walker then stops at the
+        # door rather than trying to step through a tile it wrongly believes is open, and
+        # navigate_to's open-the-door branch engages.
         if phase == "warm":
-            colony.seed_for_test(fixture.costs, fixture.links, fixture.tiles)
+            for fixture in fixtures:
+                colony.seed_for_test(fixture.costs, fixture.links, fixture.tiles)
         session = await gm.connect_retry(flags, ACCOUNT, PASSWORD, CHARACTER,
                                          host=HOST, login_port=LOGIN_PORT)
         session.colony = colony
@@ -524,13 +606,14 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
             # stairs), forcing each door to its CLOSED id so the local walker also stops at it
             # and navigate_to opens it — as a real revisit would.
             if phase == "warm":
-                seed = {t: list(stack) for t, stack in fixture.tiles.items()}
-                for s in test.setup:
-                    stack = seed.get((s.x, s.y, s.z), [])
-                    stack = [((s.to_id, c) if iid == s.from_id else (iid, c))
-                             for iid, c in stack]
-                    seed[(s.x, s.y, s.z)] = stack or [(s.to_id, 1)]
-                sess.state.tiles.update(seed)
+                for fixture in fixtures:
+                    seed = {t: list(stack) for t, stack in fixture.tiles.items()}
+                    for s in test.setup:
+                        stack = seed.get((s.x, s.y, s.z), [])
+                        stack = [((s.to_id, c) if iid == s.from_id else (iid, c))
+                                 for iid, c in stack]
+                        seed[(s.x, s.y, s.z)] = stack or [(s.to_id, 1)]
+                    sess.state.tiles.update(seed)
             # Put the bot at the start and close the door — the scenario precondition.
             await gm.gm_run(flags, f"/tpto {CHARACTER}, {test.start[0]}, {test.start[1]}, "
                                    f"{test.start[2]}", *[f"/settile {a}" for a in closes])
@@ -541,19 +624,30 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
                     break
             p = sess.state.position
             if p is None or (p.x, p.y, p.z) != test.start:
-                measured[phase] = (False, 0, [])
+                measured[phase] = [(False, 0, [])]
                 return
-            sess.path_log = []                  # capture this pass's route (see the move hook)
-            loop = asyncio.get_event_loop()
-            arrived = await client.navigate_to(sess, flags, test.dest[0], test.dest[1],
-                                                test.dest[2],
-                                                deadline=loop.time() + test.time_limit)
-            # Price the exact route walked: prepend the start (the move hook records only tiles
-            # we STEPPED onto, not the one we began on), then sum step costs from the frozen
-            # table.
-            path = [test.start] + navcost.as_tiles(sess.path_log)
+            sess.path_log = []       # capture the WHOLE run's route (see the move hook); we
+                                     # slice it per leg below rather than resetting between legs,
+                                     # so leg 2 starts from wherever leg 1 actually ended.
+            leg_results: list[tuple[bool, int, list]] = []
+            cur = test.start
+            for leg_i, (_leg_start, leg_dest) in enumerate(legs):
+                before = len(sess.path_log)
+                loop = asyncio.get_event_loop()
+                arrived = await client.navigate_to(sess, flags, leg_dest[0], leg_dest[1],
+                                                    leg_dest[2],
+                                                    deadline=loop.time() + test.time_limit)
+                # This leg's slice of the log, prepended with where the leg STARTED (the move
+                # hook records only tiles we stepped onto), priced against THIS leg's own
+                # frozen table (the two legs' regions may not even overlap).
+                path = [cur] + navcost.as_tiles(sess.path_log[before:])
+                leg_results.append(
+                    (arrived, navcost.route_cost(path, cost_of_per_leg[leg_i]), path))
+                if not arrived:
+                    break   # can't honestly attempt a leg from a destination we never reached
+                cur = leg_dest
             sess.path_log = None
-            measured[phase] = (arrived, navcost.route_cost(path, cost_of), path)
+            measured[phase] = leg_results
 
         try:
             await client._run_in_world(session, action)
@@ -571,37 +665,55 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
         except Exception as err:  # noqa: BLE001 — a harness must not crash on one phase
             return Result(test.name, "ERROR", f"{phase}: {type(err).__name__}: {err}")
 
-    # Assemble the report. A pass that didn't arrive is a hard FAIL; otherwise each measured
-    # pass is checked against its own budget (None = report-only).
-    par = fixture.par_cost or 1
+    # Assemble the report. A pass that didn't arrive on EVERY leg is a hard FAIL; otherwise
+    # each measured pass's TOTAL cost (summed across legs) is checked against its own budget
+    # (None = report-only). Multi-leg tests also show each leg's own cost/ratio, since "which
+    # leg is slow" is usually the whole reason one exists.
     budgets = {"cold": test.cold_budget, "warm": test.warm_budget}
     parts: list[str] = []
     status = "PASS"
     for phase in ("cold", "warm"):
         if phase not in measured:
             continue
-        arrived, cost, path = measured[phase]
-        if not arrived:
+        leg_results = measured[phase]
+        if trace:
+            for leg_i, (arrived, cost, path) in enumerate(leg_results):
+                par_i = fixtures[leg_i].par_cost or 1
+                tag = f"x{cost / par_i:.2f}" if arrived else "DID NOT ARRIVE"
+                print(f"    {phase} leg {leg_i + 1} route ({cost}, {tag}):\n"
+                      f"{_trace(path, cost_of_per_leg[leg_i])}")
+        all_arrived = len(leg_results) == len(legs) and all(a for a, _c, _p in leg_results)
+        if not all_arrived:
             status = "FAIL"
-            parts.append(f"{phase}: DID NOT ARRIVE")
+            parts.append(f"{phase}: DID NOT ARRIVE (leg {len(leg_results)})")
             continue
-        ratio = cost / par
+        total_cost = sum(cost for _a, cost, _p in leg_results)
+        ratio = total_cost / par_total
         gate = budgets[phase]
         flag = ""
         if gate is not None and ratio > gate:
             status = "FAIL"
             flag = f" >budget {gate:.2f}"
-        parts.append(f"{phase} {cost} (x{ratio:.2f}{flag})")
-        if trace:
-            print(f"    {phase} route ({cost}, x{ratio:.2f}):\n{_trace(path, cost_of)}")
+        if multi:
+            leg_str = ", ".join(
+                f"leg{i + 1} {cost}(x{cost / (fixtures[i].par_cost or 1):.2f})"
+                for i, (_a, cost, _p) in enumerate(leg_results))
+            parts.append(f"{phase} {leg_str}, total {total_cost} (x{ratio:.2f}{flag})")
+        else:
+            parts.append(f"{phase} {total_cost} (x{ratio:.2f}{flag})")
     if "cold" in measured and "warm" in measured \
-            and measured["cold"][0] and measured["warm"][0]:
-        gain = measured["cold"][1] - measured["warm"][1]
-        pct = 100 * gain / (measured["cold"][1] or 1)
+            and len(measured["cold"]) == len(legs) and all(a for a, _c, _p in measured["cold"]) \
+            and len(measured["warm"]) == len(legs) and all(a for a, _c, _p in measured["warm"]):
+        cold_total = sum(c for _a, c, _p in measured["cold"])
+        warm_total = sum(c for _a, c, _p in measured["warm"])
+        gain = cold_total - warm_total
+        pct = 100 * gain / (cold_total or 1)
         parts.append(f"improvement {gain} ({pct:+.0f}%)")
     if trace:
-        print(f"    optimal floor ({par}):\n{_trace(fixture.par_path, cost_of)}")
-    return Result(test.name, status, f"par={par}; " + ", ".join(parts))
+        for leg_i, fixture in enumerate(fixtures):
+            print(f"    leg {leg_i + 1} optimal floor ({fixture.par_cost}):\n"
+                  f"{_trace(fixture.par_path, cost_of_per_leg[leg_i])}")
+    return Result(test.name, status, f"par={par_total}; " + ", ".join(parts))
 
 
 async def run_all(filter_substr: str | None, phases: list[str] | None = None,
