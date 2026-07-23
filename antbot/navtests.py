@@ -38,6 +38,7 @@ import time
 from .items import ItemFlags
 from .catalog import impassable_ground_ids, load_item_catalog
 from .colony import Colony
+from .tracing import FrameLogger
 from . import client, wire, gm, navcost, navfixture
 
 log = logging.getLogger("antbot.navtests")
@@ -320,7 +321,8 @@ class Result:
         return f"  [{mark}] {self.status:5} {self.name}{t}\n        {self.detail}"
 
 
-async def _drive(colony: Colony, flags: ItemFlags, test: NavTest) -> Result:
+async def _drive(colony: Colony, flags: ItemFlags, test: NavTest,
+                 frames: FrameLogger | None = None) -> Result:
     """Log the (already-teleported) bot in, verify preconditions, then navigate."""
     session = await gm.connect_retry(flags, ACCOUNT, PASSWORD, CHARACTER,
                                      host=HOST, login_port=LOGIN_PORT)
@@ -395,7 +397,8 @@ async def _drive(colony: Colony, flags: ItemFlags, test: NavTest) -> Result:
         dx, dy, dz = test.dest
         t0 = asyncio.get_event_loop().time()
         deadline = t0 + test.time_limit
-        arrived = await client.navigate_to(sess, flags, dx, dy, dz, deadline=deadline)
+        arrived = await client.navigate_to(sess, flags, dx, dy, dz, deadline=deadline,
+                                           frames=frames)
         elapsed = asyncio.get_event_loop().time() - t0
         end = sess.state.position
         endpos = (end.x, end.y, end.z) if end else None
@@ -415,7 +418,7 @@ async def _drive(colony: Colony, flags: ItemFlags, test: NavTest) -> Result:
     return outcome["result"] or Result(test.name, "ERROR", "no result recorded")
 
 
-async def run_test(test: NavTest) -> Result:
+async def run_test(test: NavTest, frames: FrameLogger | None = None) -> Result:
     print(f"\n>>> {test.name}")
     print(f"    start {test.start} -> dest {test.dest}, limit {test.time_limit:.0f}s")
 
@@ -445,7 +448,7 @@ async def run_test(test: NavTest) -> Result:
     flags.add_impassable_ground(impassable_ground_ids(load_item_catalog(ITEMS_XML)))
     colony = Colony(item_flags=flags)
     try:
-        return await _drive(colony, flags, test)
+        return await _drive(colony, flags, test, frames=frames)
     finally:
         # Teardown: force the test bot OFFLINE so it can't linger (its graceful logout can
         # be declined by the server — combat/PZ rules). Best-effort; a not-online char is a
@@ -495,7 +498,7 @@ def _trace(path: list, cost_of) -> str:
 
 
 async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
-                         rebuild_fixture: bool) -> Result:
+                         rebuild_fixture: bool, frames: FrameLogger | None = None) -> Result:
     """Score `test` for route efficiency, pricing each route against the frozen time-optimal
     floor and gating on the per-pass budgets.
 
@@ -636,7 +639,8 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
                 loop = asyncio.get_event_loop()
                 arrived = await client.navigate_to(sess, flags, leg_dest[0], leg_dest[1],
                                                     leg_dest[2],
-                                                    deadline=loop.time() + test.time_limit)
+                                                    deadline=loop.time() + test.time_limit,
+                                                    frames=frames)
                 # This leg's slice of the log, prepended with where the leg STARTED (the move
                 # hook records only tiles we stepped onto), priced against THIS leg's own
                 # frozen table (the two legs' regions may not even overlap).
@@ -717,7 +721,8 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
 
 
 async def run_all(filter_substr: str | None, phases: list[str] | None = None,
-                  trace: bool = False, rebuild_fixture: bool = False) -> int:
+                  trace: bool = False, rebuild_fixture: bool = False,
+                  frames: FrameLogger | None = None) -> int:
     phases = phases or ["cold", "warm"]
     tests = [t for t in TESTS
              if not filter_substr or filter_substr.lower() in t.name.lower()]
@@ -730,9 +735,10 @@ async def run_all(filter_substr: str | None, phases: list[str] | None = None,
             await asyncio.sleep(3)   # space logins out — Canary throttles rapid ones
         try:
             if t.measure_efficiency:
-                results.append(await run_efficiency(t, phases, trace, rebuild_fixture))
+                results.append(await run_efficiency(t, phases, trace, rebuild_fixture,
+                                                    frames=frames))
             else:
-                results.append(await run_test(t))
+                results.append(await run_test(t, frames=frames))
         except Exception as err:     # noqa: BLE001 — one test's failure isn't the suite's
             results.append(Result(t.name, "ERROR", f"{type(err).__name__}: {err}"))
     print("\n" + "=" * 60 + "\nNavigation test results:")
@@ -765,10 +771,26 @@ def main() -> None:
                     help="efficiency tests: re-reveal the region and recompute the frozen "
                          "par_cost floor before scoring (use after changing the map or the "
                          "cost model).")
+    ap.add_argument("--verbose-calls", action="store_true",
+                    help="log every decorated function's call (name, args) and return value "
+                         "at DEBUG on the 'antbot.calls' logger — see tracing.log_call. "
+                         "Very noisy; meant for hunting a specific bug, not routine runs.")
+    ap.add_argument("--frame-log", metavar="PATH", default=None,
+                    help="record every navigate_to call's planner internals (find_shared_route/"
+                         "find_nearest_step_toward, frame by frame — every node popped, every "
+                         "edge relaxed) as JSONL at PATH, for a future visualization tool to "
+                         "replay. See tracing.FrameLogger. Appends if the file already exists.")
     args = ap.parse_args()
+    if args.verbose_calls:
+        logging.getLogger("antbot.calls").setLevel(logging.DEBUG)
     phases = ["cold", "warm"] if args.phase == "both" else [args.phase]
-    raise SystemExit(asyncio.run(run_all(args.filter, phases, args.trace,
-                                         args.rebuild_fixture)))
+    frames = FrameLogger(args.frame_log) if args.frame_log else None
+    try:
+        raise SystemExit(asyncio.run(run_all(args.filter, phases, args.trace,
+                                             args.rebuild_fixture, frames=frames)))
+    finally:
+        if frames is not None:
+            frames.close()
 
 
 if __name__ == "__main__":

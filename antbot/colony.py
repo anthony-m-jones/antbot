@@ -29,6 +29,7 @@ from pathlib import Path
 from .assets import items_xml_path
 from .catalog import impassable_ground_ids, load_item_catalog
 from .items import ItemFlags, automap_color_to_rgb
+from .tracing import log_call
 from .traversal import TraversalRegistry
 from .world import GameState
 
@@ -726,6 +727,7 @@ class Colony:
                 return color
         return _DEFAULT_COLOR_INDEX
 
+    @log_call
     def contribute_tiles(self, state: GameState) -> int:
         """Fold a bot's parsed tiles into the shared explored map.
 
@@ -818,6 +820,7 @@ class Colony:
                 return set(self._frontiers)
             return {f for f in self._frontiers if f[2] == z}
 
+    @log_call
     def reachable_frontier(self, x: int, y: int, z: int,
                            skip: set | None = None,
                            center: tuple[int, int] | None = None,
@@ -903,6 +906,7 @@ class Colony:
 
     # -- shared hazard learning -------------------------------------------
 
+    @log_call
     def report_link(self, source: tuple[int, int, int], dest: tuple[int, int, int],
                     action: str) -> None:
         """A bot found that `source` leads to `dest` — either by walking onto it (a
@@ -929,6 +933,7 @@ class Colony:
             if changed:
                 self._save_knowledge()
 
+    @log_call
     def confirm_link(self, source: tuple[int, int, int], dest: tuple[int, int, int]) -> None:
         """Travel actually took this shortcut and it led to `dest` — trust it.
 
@@ -944,6 +949,7 @@ class Colony:
                 self._save_knowledge()
             self._unconfirmed_crossings.discard(source)
 
+    @log_call
     def mark_bad_link(self, source: tuple[int, int, int]) -> None:
         """Travel stepped on `source` and it did NOT relocate us — prune it.
 
@@ -974,9 +980,34 @@ class Colony:
             return set(self._step_links)
 
     def get_hazards(self) -> set[tuple[int, int, int]]:
-        """A copy of all known hazard tiles, for a bot to fold into its avoid set."""
+        """A copy of all known hazard tiles. Raw — includes USE-type link sources (a
+        ladder/grate/door), which `report_link` files here too even though walking onto or
+        near one does nothing on its own. Most callers doing ORDINARY walking (not deliberate
+        link-routing) want `get_avoid_hazards()` instead; this is exposed for callers that
+        already handle the step/use distinction themselves (`travel`, the scout's frontier
+        search — both subtract `get_links()` wholesale because they route THROUGH links)."""
         with self._lock:
             return set(self._hazards)
+
+    def get_avoid_hazards(self) -> set[tuple[int, int, int]]:
+        """Hazards worth hard-avoiding during ORDINARY walking (no link-routing involved):
+        every hazard EXCEPT a USE-type link source.
+
+        A STEP-type link source (a hole/stairs/teleporter) stays avoided — an accidental
+        step onto it really does relocate you, which is exactly what a plain walk must
+        never risk. A USE-type one (a ladder/grate/door) does nothing when merely walked
+        over or stood on; treating it as forbidden ground anyway is a real bug, not just
+        over-caution: once ANY bot reports such a link, its own tile becomes permanently
+        unreachable as a destination for every future walk, since nothing else can ever
+        get there. This is what actually broke a bot trying to just stand on a learned
+        grate — `report_link`/`seed_for_test` mark every link source a hazard regardless
+        of kind, and hazards used to be merged in wholesale (see `_report_to_colony`'s
+        blocked_tiles union and the stuck-recovery in `_check_watchdog`, both fixed to call
+        this instead of `get_hazards()` directly).
+        """
+        with self._lock:
+            use_only_links = set(self._links) - self._step_links
+            return self._hazards - use_only_links
 
     def get_links(self) -> dict[tuple[int, int, int], tuple[int, int, int]]:
         """A copy of all known teleport/floor-change shortcuts, for routing."""
@@ -1006,6 +1037,7 @@ class Colony:
         with self._lock:
             return dict(self._walk_cost)
 
+    @log_call
     def seed_for_test(self, walk_costs: dict[tuple[int, int, int], int],
                       links: dict[tuple[int, int, int], tuple[int, int, int]],
                       tiles: dict[tuple[int, int, int], list] | None = None) -> None:
