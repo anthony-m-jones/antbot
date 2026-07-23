@@ -27,7 +27,7 @@ from . import wire
 from .items import ItemFlags
 from .wire import MessageReader, MessageWriter
 from .carry import plan_pickup, value_of
-from .tracing import FrameLogger, log_call
+from .tracing import log_call
 from .world import GameState, parse_login_snapshot, process_world_frame, tile_ids
 
 log = logging.getLogger("antbot")
@@ -1115,8 +1115,7 @@ async def _autowalk_run(session: GameSession, chunk: list[str], start):
 @log_call
 async def _walk_local(session: GameSession, item_flags: ItemFlags,
                       goal_x: int, goal_y: int, max_steps: int = 300,
-                      plan_radius: int | None = None, log_stuck: bool = True,
-                      frames: FrameLogger | None = None) -> bool:
+                      plan_radius: int | None = None, log_stuck: bool = True) -> bool:
     """Walk the character to (goal_x, goal_y), following the path via chunked
     auto-walk and re-planning after each chunk (or the moment a step misbehaves).
 
@@ -1177,7 +1176,7 @@ async def _walk_local(session: GameSession, item_flags: ItemFlags,
         path = find_nearest_step_toward(session.state, item_flags, goal_x, goal_y,
                                 max_radius=plan_radius, extra_walkable=shared,
                                 registry=registry, confirmed_links=known_links,
-                                unconfirmed_crossings=colony_hazards, frames=frames)
+                                unconfirmed_crossings=colony_hazards)
         # Publish the intent BEFORE acting on it, so a bot that can't plan still shows
         # the dashboard what it was reaching for. That "goal set, plan empty" state is
         # precisely what an outside observer sees as a frozen bot. `plan_source` records
@@ -1297,8 +1296,7 @@ def _path_tiles(start, directions: list[str]) -> list[tuple[int, int, int]]:
 @log_call
 async def _follow_shared_route(session: GameSession, item_flags: ItemFlags,
                                goal_x: int, goal_y: int, goal_z: int, reach: int = 0,
-                               max_steps: int = 400,
-                               frames: FrameLogger | None = None) -> bool:
+                               max_steps: int = 400) -> bool:
     """Walk to (or within `reach` of) a goal by following a route planned over the
     COLONY's shared explored map. Returns True if we arrived.
 
@@ -1369,7 +1367,7 @@ async def _follow_shared_route(session: GameSession, item_flags: ItemFlags,
         route = find_shared_route(colony.get_walkable(), {}, here, goal, reach=reach,
                            avoid=avoid, costs=colony.get_walk_costs(),
                            unconfirmed_crossings=colony.get_unconfirmed_crossings(),
-                           step_links=colony.get_step_links(), frames=frames)
+                           step_links=colony.get_step_links())
         session.goal = goal
         session.plan = [landing for _dir, _tp, landing in route] if route else []
         session.plan_source = "shared"   # find_shared_route over the colony map
@@ -2009,7 +2007,7 @@ async def _try_change_floor(session: GameSession, item_flags: ItemFlags,
 @log_call
 async def travel(session: GameSession, item_flags: ItemFlags,
                  goal_x: int, goal_y: int, goal_z: int, max_hops: int = 40,
-                 reach: int = 0, frames: FrameLogger | None = None) -> bool:
+                 reach: int = 0) -> bool:
     """Travel to (goal_x, goal_y, goal_z) across the whole world, using shortcuts.
 
     Plans a route with `find_shared_route` over the colony's shared walkable map + learned
@@ -2058,7 +2056,7 @@ async def travel(session: GameSession, item_flags: ItemFlags,
                            reach=reach, avoid=colony.get_hazards() - set(links),
                            costs=colony.get_walk_costs(),
                            unconfirmed_crossings=colony.get_unconfirmed_crossings(),
-                           step_links=colony.get_step_links(), frames=frames)
+                           step_links=colony.get_step_links())
         if route is None:
             # Nothing in the shared map connects us — normal when the goal is somewhere
             # nobody has been, or when we're standing in a not-yet-connected pocket.
@@ -2068,7 +2066,7 @@ async def travel(session: GameSession, item_flags: ItemFlags,
             # — 68 steps. Returning here instead of re-planning threw that away.)
             log.info("travel: no route from %s to (%d,%d,%d) in the known world; "
                      "trying local navigation", here, goal_x, goal_y, goal_z)
-            await _walk_local(session, item_flags, goal_x, goal_y, frames=frames)
+            await _walk_local(session, item_flags, goal_x, goal_y)
             colony.contribute_tiles(session.state)   # publish what we just revealed
             p = session.state.position
             if p is None:
@@ -2089,12 +2087,12 @@ async def travel(session: GameSession, item_flags: ItemFlags,
             # planned over the shared map — NOT `_walk_local`, which would discard it and
             # re-guess from this bot's private, ~8-tile view (see `_follow_shared_route`).
             if await _follow_shared_route(session, item_flags, goal_x, goal_y, goal_z,
-                                  reach=reach, frames=frames):
+                                  reach=reach):
                 continue
             # The shared route ran out (unexplored last stretch, or we got pushed off
             # it). Feel the rest of the way locally, then re-plan: what we just walked
             # over may complete the map.
-            await _walk_local(session, item_flags, goal_x, goal_y, frames=frames)
+            await _walk_local(session, item_flags, goal_x, goal_y)
             colony.contribute_tiles(session.state)
             p = session.state.position
             if p is None:
@@ -2113,8 +2111,8 @@ async def travel(session: GameSession, item_flags: ItemFlags,
             # Walk on foot to the launch tile (same floor as us), following the shared
             # route; fall back to local navigation only if that can't do it.
             if not await _follow_shared_route(session, item_flags, launch[0], launch[1],
-                                      launch[2], frames=frames):
-                await _walk_local(session, item_flags, launch[0], launch[1], frames=frames)
+                                      launch[2]):
+                await _walk_local(session, item_flags, launch[0], launch[1])
             p = session.state.position
             if p is None or (p.x, p.y, p.z) != launch:
                 log.info("travel: couldn't reach shortcut launch %s; aborting", launch)
@@ -2640,8 +2638,7 @@ async def scout_session(host: str, login_port: int, account: str, password: str,
 @log_call
 async def navigate_to(session: GameSession, item_flags: ItemFlags,
                       x: int, y: int, z: int, deadline: float | None = None,
-                      only: set[str] | None = _DOOR_CATEGORIES,
-                      frames: FrameLogger | None = None) -> bool:
+                      only: set[str] | None = _DOOR_CATEGORIES) -> bool:
     """Directed navigation to an EXACT tile — the ONE place "get me to a known point"
     lives, used by the nav tests AND (see `scout`) by any bot heading to a destination
     it already picked (a frontier, a learned shortcut, home). Scout's OWN job stays
@@ -2677,11 +2674,11 @@ async def navigate_to(session: GameSession, item_flags: ItemFlags,
     a stale block from a bot/player that has since moved on. Generalized here so it isn't
     scout-only: any caller heading to a known destination gets it.
 
-    `frames` (pass a `tracing.FrameLogger`) threads through to every planner call this
-    makes (`travel`'s own `find_shared_route`, `_follow_shared_route`'s, `_walk_local`'s
-    `find_nearest_step_toward`) so ONE navigate_to call's whole planning history — every
-    algorithm's every frame, across however many rounds it takes — lands in one JSONL
-    file. None (the default) costs nothing.
+    Every planner call underneath this one (`travel`'s own `find_shared_route`,
+    `_follow_shared_route`'s, `_walk_local`'s `find_nearest_step_toward`) automatically
+    records to whatever `tracing.EventRecorder` is bound for the current context (see
+    `tracing.bind_recorder`) — no parameter needed here, or anywhere in the call chain
+    below; that's the whole point of making it ambient. Costs nothing when none is bound.
     """
     loop = asyncio.get_event_loop()
     door_tried: dict = {}    # door tile -> retry time, so we don't hammer one that won't open
@@ -2719,7 +2716,7 @@ async def navigate_to(session: GameSession, item_flags: ItemFlags,
         # Prefer the shared-map router (it uses learned links and crosses floors when the
         # colony knows a connecting route).
         if (session.colony is not None
-                and await travel(session, item_flags, x, y, z, frames=frames)):
+                and await travel(session, item_flags, x, y, z)):
             nav_stuck = 0
             continue
 
@@ -2762,7 +2759,7 @@ async def navigate_to(session: GameSession, item_flags: ItemFlags,
             # (a closed door, or — for a caller that allows it — any known exit) may block
             # the only route: clear the nearest one the walker parked us beside.
             await _walk_local(session, item_flags, x, y,
-                           max_steps=60, plan_radius=_PLAN_RADIUS, frames=frames)
+                           max_steps=60, plan_radius=_PLAN_RADIUS)
             after = session.state.position
             after_t = (after.x, after.y, after.z) if after is not None else None
             if after_t == before:

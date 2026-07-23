@@ -10,6 +10,7 @@ venv/
 # Runtime / generated — per-world state and captures, not source.
 # (Comments must be on their own line; trailing comments are treated as pattern text.)
 recordings/
+frame_logs/
 antbot/learned_hazards.json
 antbot/learned_objects.json
 

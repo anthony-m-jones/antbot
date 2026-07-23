@@ -17,7 +17,7 @@ import heapq
 import logging
 
 from .items import ItemFlags
-from .tracing import FrameLogger, log_call
+from .tracing import current_call_id, current_recorder, log_call
 from .world import GameState, tile_ids
 
 log = logging.getLogger("antbot")
@@ -334,7 +334,6 @@ def find_nearest_step_toward(state: GameState, item_flags: ItemFlags,
                               registry=None,
                               confirmed_links: set[tuple[int, int, int]] | None = None,
                               unconfirmed_crossings: set[tuple[int, int, int]] | None = None,
-                              frames: FrameLogger | None = None,
                               ) -> list[str] | None:
     """Path *toward* (goal_x, goal_y), even if it's beyond what we've seen.
 
@@ -389,7 +388,10 @@ def find_nearest_step_toward(state: GameState, item_flags: ItemFlags,
     fallback for anything only this bot has ever seen.
 
     LOGGING: emits to the `antbot.route` logger — see `find_shared_route`'s docstring and
-    `nav.route_log`.
+    `nav.route_log`. Also emits frame-by-frame JSONL to whatever `tracing.EventRecorder`
+    is bound for this context (see `tracing.current_recorder` — no parameter needed here;
+    this function is itself `@log_call`-decorated, so its own frames tag themselves with
+    `tracing.current_call_id()` automatically).
 
     Returns the directions toward that best frontier tile, or None if we can't get
     any closer (blocked in, or the goal's direction is walled off in known space).
@@ -421,17 +423,20 @@ def find_nearest_step_toward(state: GameState, item_flags: ItemFlags,
     best_dist = abs(start[0] - goal[0]) + abs(start[1] - goal[1])
     debug = route_log.isEnabledFor(logging.DEBUG)
     gambled_tiles: set[tuple[int, int]] = set()
-    if frames is not None:
-        frames.emit("start", algo="find_nearest_step_toward", start=(start[0], start[1], z),
-                    goal=(goal_x, goal_y), max_radius=max_radius)
+    recorder = current_recorder()
+    call_id = current_call_id()
+    if recorder is not None:
+        recorder.emit("start", call_id=call_id, algo="find_nearest_step_toward",
+                      start=(start[0], start[1], z), goal=(goal_x, goal_y),
+                      max_radius=max_radius)
 
     while heap:
         cost, current = heapq.heappop(heap)
         if current in settled:
             continue
         settled.add(current)
-        if frames is not None:
-            frames.emit("pop", node=(current[0], current[1], z), cost=cost)
+        if recorder is not None:
+            recorder.emit("pop", call_id=call_id, node=(current[0], current[1], z), cost=cost)
         distance = abs(current[0] - goal[0]) + abs(current[1] - goal[1])
         # A gambled-onto tile (an unconfirmed z-hop) must NEVER become the walk-toward
         # TARGET on raw geometric proximity alone. This selection is distance-only —
@@ -495,10 +500,10 @@ def find_nearest_step_toward(state: GameState, item_flags: ItemFlags,
                     (current[0], current[1], z), name, n_tile, step,
                     "GAMBLE unconfirmed z-hop" if gamble else "ground", nd,
                     " [IMPROVED]" if improved else " [no improvement, skipped]")
-            if frames is not None:
-                frames.emit("relax", node=(current[0], current[1], z), direction=name,
-                            landing=n_tile, step=step, total=nd, gamble=gamble,
-                            improved=improved)
+            if recorder is not None:
+                recorder.emit("relax", call_id=call_id, node=(current[0], current[1], z),
+                              direction=name, landing=n_tile, step=step, total=nd,
+                              gamble=gamble, improved=improved)
             if improved:
                 best_cost[neighbor] = nd
                 came_from[neighbor] = (current, name)
@@ -512,16 +517,18 @@ def find_nearest_step_toward(state: GameState, item_flags: ItemFlags,
         if debug:
             route_log.debug("find_nearest_step_toward: nothing reachable is closer than %s to %s",
                             start, goal)
-        if frames is not None:
-            frames.emit("no_route", start=(start[0], start[1], z), goal=(goal_x, goal_y))
+        if recorder is not None:
+            recorder.emit("no_route", call_id=call_id, start=(start[0], start[1], z),
+                          goal=(goal_x, goal_y))
         return None  # nothing reachable is closer than where we already stand
     path = _reconstruct(came_from, best)
     if best in gambled_tiles:
         route_log.info("find_nearest_step_toward: DECIDED to head for an unconfirmed z-hop at "
                        "%s (best reachable tile toward %s from %s)", best, goal, start)
-    if frames is not None:
-        frames.emit("done", start=(start[0], start[1], z), goal=(goal_x, goal_y),
-                    target=(best[0], best[1], z), cost=best_cost.get(best, -1), path=path)
+    if recorder is not None:
+        recorder.emit("done", call_id=call_id, start=(start[0], start[1], z),
+                      goal=(goal_x, goal_y), target=(best[0], best[1], z),
+                      cost=best_cost.get(best, -1), path=path)
     return path
 
 
@@ -713,7 +720,6 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
                       costs: dict[tuple[int, int, int], int] | None = None,
                       unconfirmed_crossings: set[tuple[int, int, int]] | None = None,
                       step_links: set[tuple[int, int, int]] | None = None,
-                      frames: FrameLogger | None = None,
                       ) -> list[tuple[str, bool, tuple[int, int, int]]] | None:
     """Route across the *whole known world*, using teleports/stairs as shortcuts.
 
@@ -787,10 +793,11 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
     (a unconfirmed_crossings tile actually winning a spot on the final route) — see
     `nav.route_log`. Off by default; turn it on to watch the search's own reasoning.
 
-    `frames` (pass a `tracing.FrameLogger`) records the SAME search, frame by frame, as
-    structured JSONL instead of free-text — a "pop" per node dequeued, a "relax" per edge
-    considered, meant for a future visualization tool to replay rather than for a human to
-    read live. None (the default) costs nothing; see tracing.FrameLogger.
+    Also emits frame-by-frame JSONL to whatever `tracing.EventRecorder` is bound for this
+    context (see `tracing.current_recorder`) — a "pop" per node dequeued, a "relax" per
+    edge considered — for `frame_viewer.html` to replay. No parameter needed here: this
+    function is itself `@log_call`-decorated, so its own frames tag themselves with
+    `tracing.current_call_id()` automatically. Costs nothing when no recorder is bound.
     """
     if within_reach(start, goal, reach):
         return []
@@ -806,10 +813,12 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
         route_log.debug("find_shared_route: start=%s goal=%s reach=%d, %d unconfirmed z-hop "
                         "candidate(s) in view: %s",
                         start, goal, reach, len(unconfirmed_crossings), sorted(unconfirmed_crossings))
-    if frames is not None:
-        frames.emit("start", algo="find_shared_route", start=start, goal=goal, reach=reach,
-                    walkable=len(walkable), links=len(links), avoid=len(avoid),
-                    unconfirmed_crossings=sorted(unconfirmed_crossings))
+    recorder = current_recorder()
+    call_id = current_call_id()
+    if recorder is not None:
+        recorder.emit("start", call_id=call_id, algo="find_shared_route", start=start,
+                      goal=goal, reach=reach, walkable=len(walkable), links=len(links),
+                      avoid=len(avoid), unconfirmed_crossings=sorted(unconfirmed_crossings))
 
     # START is itself a link source? Seed the "trigger it right here" edge (sentinel
     # direction "__here__") — see the docstring. Only relevant for a USE-type source in
@@ -826,15 +835,15 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
             if debug:
                 route_log.debug("  seed %s -__here__-> %s  step=%d (start is itself a link)",
                                 start, here_landing, here_step)
-            if frames is not None:
-                frames.emit("relax", node=start, direction="__here__", landing=here_landing,
-                            step=here_step, total=here_step, teleport=True, gamble=False,
-                            improved=True, seed=True)
+            if recorder is not None:
+                recorder.emit("relax", call_id=call_id, node=start, direction="__here__",
+                              landing=here_landing, step=here_step, total=here_step,
+                              teleport=True, gamble=False, improved=True, seed=True)
 
     while heap:
         d, node = heapq.heappop(heap)
-        if frames is not None:
-            frames.emit("pop", node=node, dist=d)
+        if recorder is not None:
+            recorder.emit("pop", call_id=call_id, node=node, dist=d)
         if within_reach(node, goal, reach):
             target = node
             break
@@ -883,10 +892,10 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
                         "GAMBLE unconfirmed z-hop" if gamble else ("link" if teleport else "ground"),
                         nd, " -> confirmed link" if teleport else "",
                         " [IMPROVED]" if improved else " [no improvement, skipped]")
-                if frames is not None:
-                    frames.emit("relax", node=node, direction=name, landing=landing,
-                                step=step, total=nd, teleport=teleport, gamble=gamble,
-                                improved=improved)
+                if recorder is not None:
+                    recorder.emit("relax", call_id=call_id, node=node, direction=name,
+                                  landing=landing, step=step, total=nd, teleport=teleport,
+                                  gamble=gamble, improved=improved)
                 if improved:
                     dist[landing] = nd
                     prev[landing] = (node, name, teleport)
@@ -895,8 +904,8 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
     if target is None or target not in prev:
         if debug:
             route_log.debug("find_shared_route: NO ROUTE found from %s to %s", start, goal)
-        if frames is not None:
-            frames.emit("no_route", start=start, goal=goal)
+        if recorder is not None:
+            recorder.emit("no_route", call_id=call_id, start=start, goal=goal)
         return None
 
     route: list[tuple[str, bool, tuple[int, int, int]]] = []
@@ -915,10 +924,11 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
     elif debug:
         route_log.debug("find_shared_route: settled on an all-confirmed-ground route %s -> %s "
                         "(total cost %d)", start, goal, dist.get(target, -1))
-    if frames is not None:
-        frames.emit("done", start=start, goal=goal, target=target, cost=dist.get(target, -1),
-                    route=[[direction, teleport, list(landing)]
-                           for direction, teleport, landing in route])
+    if recorder is not None:
+        recorder.emit("done", call_id=call_id, start=start, goal=goal, target=target,
+                      cost=dist.get(target, -1),
+                      route=[[direction, teleport, list(landing)]
+                             for direction, teleport, landing in route])
     return route
 
 

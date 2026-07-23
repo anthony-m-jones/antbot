@@ -30,15 +30,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import datetime
 import logging
 import socket
 import subprocess
 import time
+from pathlib import Path
 
 from .items import ItemFlags
 from .catalog import impassable_ground_ids, load_item_catalog
 from .colony import Colony
-from .tracing import FrameLogger
+from . import tracing
+from .tracing import EventRecorder
 from . import client, wire, gm, navcost, navfixture
 
 log = logging.getLogger("antbot.navtests")
@@ -321,8 +324,7 @@ class Result:
         return f"  [{mark}] {self.status:5} {self.name}{t}\n        {self.detail}"
 
 
-async def _drive(colony: Colony, flags: ItemFlags, test: NavTest,
-                 frames: FrameLogger | None = None) -> Result:
+async def _drive(colony: Colony, flags: ItemFlags, test: NavTest) -> Result:
     """Log the (already-teleported) bot in, verify preconditions, then navigate."""
     session = await gm.connect_retry(flags, ACCOUNT, PASSWORD, CHARACTER,
                                      host=HOST, login_port=LOGIN_PORT)
@@ -397,8 +399,7 @@ async def _drive(colony: Colony, flags: ItemFlags, test: NavTest,
         dx, dy, dz = test.dest
         t0 = asyncio.get_event_loop().time()
         deadline = t0 + test.time_limit
-        arrived = await client.navigate_to(sess, flags, dx, dy, dz, deadline=deadline,
-                                           frames=frames)
+        arrived = await client.navigate_to(sess, flags, dx, dy, dz, deadline=deadline)
         elapsed = asyncio.get_event_loop().time() - t0
         end = sess.state.position
         endpos = (end.x, end.y, end.z) if end else None
@@ -418,7 +419,7 @@ async def _drive(colony: Colony, flags: ItemFlags, test: NavTest,
     return outcome["result"] or Result(test.name, "ERROR", "no result recorded")
 
 
-async def run_test(test: NavTest, frames: FrameLogger | None = None) -> Result:
+async def run_test(test: NavTest) -> Result:
     print(f"\n>>> {test.name}")
     print(f"    start {test.start} -> dest {test.dest}, limit {test.time_limit:.0f}s")
 
@@ -448,7 +449,7 @@ async def run_test(test: NavTest, frames: FrameLogger | None = None) -> Result:
     flags.add_impassable_ground(impassable_ground_ids(load_item_catalog(ITEMS_XML)))
     colony = Colony(item_flags=flags)
     try:
-        return await _drive(colony, flags, test, frames=frames)
+        return await _drive(colony, flags, test)
     finally:
         # Teardown: force the test bot OFFLINE so it can't linger (its graceful logout can
         # be declined by the server — combat/PZ rules). Best-effort; a not-online char is a
@@ -498,7 +499,7 @@ def _trace(path: list, cost_of) -> str:
 
 
 async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
-                         rebuild_fixture: bool, frames: FrameLogger | None = None) -> Result:
+                         rebuild_fixture: bool) -> Result:
     """Score `test` for route efficiency, pricing each route against the frozen time-optimal
     floor and gating on the per-pass budgets.
 
@@ -639,8 +640,7 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
                 loop = asyncio.get_event_loop()
                 arrived = await client.navigate_to(sess, flags, leg_dest[0], leg_dest[1],
                                                     leg_dest[2],
-                                                    deadline=loop.time() + test.time_limit,
-                                                    frames=frames)
+                                                    deadline=loop.time() + test.time_limit)
                 # This leg's slice of the log, prepended with where the leg STARTED (the move
                 # hook records only tiles we stepped onto), priced against THIS leg's own
                 # frozen table (the two legs' regions may not even overlap).
@@ -721,8 +721,7 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
 
 
 async def run_all(filter_substr: str | None, phases: list[str] | None = None,
-                  trace: bool = False, rebuild_fixture: bool = False,
-                  frames: FrameLogger | None = None) -> int:
+                  trace: bool = False, rebuild_fixture: bool = False) -> int:
     phases = phases or ["cold", "warm"]
     tests = [t for t in TESTS
              if not filter_substr or filter_substr.lower() in t.name.lower()]
@@ -735,10 +734,9 @@ async def run_all(filter_substr: str | None, phases: list[str] | None = None,
             await asyncio.sleep(3)   # space logins out — Canary throttles rapid ones
         try:
             if t.measure_efficiency:
-                results.append(await run_efficiency(t, phases, trace, rebuild_fixture,
-                                                    frames=frames))
+                results.append(await run_efficiency(t, phases, trace, rebuild_fixture))
             else:
-                results.append(await run_test(t, frames=frames))
+                results.append(await run_test(t))
         except Exception as err:     # noqa: BLE001 — one test's failure isn't the suite's
             results.append(Result(t.name, "ERROR", f"{type(err).__name__}: {err}"))
     print("\n" + "=" * 60 + "\nNavigation test results:")
@@ -753,13 +751,71 @@ async def run_all(filter_substr: str | None, phases: list[str] | None = None,
     return 0 if npass == len(results) else 1
 
 
+# Where a bare `--frame-log` (no path given) writes — generated data, not source, so
+# it's .gitignore'd the same way recordings/ is.
+FRAME_LOG_DIR = Path(__file__).parent.parent / "frame_logs"
+
+
+def _default_frame_log_path() -> Path:
+    """A fresh, collision-free path for a bare `--frame-log`: one timestamped file per
+    run, so nobody has to think of a name or wonder whether they're about to append onto
+    an old run's data (a PATH you give explicitly still appends — see the --frame-log
+    help text; this auto path never collides in the first place)."""
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return FRAME_LOG_DIR / f"{stamp}.jsonl"
+
+
 def main() -> None:
     logging.basicConfig(level=logging.WARNING,
                         format="%(asctime)s %(levelname)s %(message)s",
                         datefmt="%H:%M:%S")
-    ap = argparse.ArgumentParser(description="Run antbot navigation tests.")
+    ap = argparse.ArgumentParser(
+        description="Run antbot navigation tests.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+HOW TO USE THIS, IN PLAIN TERMS
+
+  python -m antbot.navtests [FILTER] [FLAGS...]
+
+  FILTER is an OPTIONAL word or phrase -- run without one and every test
+  runs. FLAGS are also optional. Both can go in ANY order, before or after
+  each other -- there's nothing to get wrong here, just add what you want.
+
+  Examples, simplest to most:
+
+    python -m antbot.navtests
+        Runs EVERY test. No filter, no flags -- the plain default.
+
+    python -m antbot.navtests --list
+        Prints every test's name and stops. Nothing actually runs. Use
+        this first if you don't know what FILTER to type.
+
+    python -m antbot.navtests door
+        Runs only tests whose name contains "door" (matching ignores
+        case, and FILTER just has to be a piece of the name, not the
+        whole thing).
+
+    python -m antbot.navtests door --trace
+        Same tests, plus a per-step cost trace for efficiency tests --
+        flags can go after FILTER like this, or before it, same result.
+
+    python -m antbot.navtests "drop through the grate" --frame-log
+        Runs that one test (quote FILTER if it has spaces in it) and
+        records its pathfinding internals to a timestamped file under
+        frame_logs/ -- the command prints exactly where. Open THAT with:
+            python -m antbot.frame_viewer frame_logs/<the file it printed>
+        to step through the search frame by frame in your browser.
+
+  Don't remember any of this later? You're reading it right now --
+  -h/--help always brings this back.
+""")
     ap.add_argument("filter", nargs="?", default=None,
-                    help="only run tests whose name contains this substring")
+                    help="only run tests whose name contains this substring "
+                         "(case-insensitive; see --list for the exact names)")
+    ap.add_argument("--list", action="store_true",
+                    help="print every test's name (and whether it's pass/fail or "
+                         "efficiency-scored) and exit immediately -- no server, no "
+                         "docker, nothing actually runs.")
     ap.add_argument("--phase", choices=["cold", "warm", "both"], default="both",
                     help="efficiency tests: run only the COLD pass, only the WARM pass, or "
                          "both (default). Lets you iterate on exploration vs routing "
@@ -772,25 +828,49 @@ def main() -> None:
                          "par_cost floor before scoring (use after changing the map or the "
                          "cost model).")
     ap.add_argument("--verbose-calls", action="store_true",
-                    help="log every decorated function's call (name, args) and return value "
-                         "at DEBUG on the 'antbot.calls' logger — see tracing.log_call. "
-                         "Very noisy; meant for hunting a specific bug, not routine runs.")
-    ap.add_argument("--frame-log", metavar="PATH", default=None,
-                    help="record every navigate_to call's planner internals (find_shared_route/"
-                         "find_nearest_step_toward, frame by frame — every node popped, every "
-                         "edge relaxed) as JSONL at PATH, for a future visualization tool to "
-                         "replay. See tracing.FrameLogger. Appends if the file already exists.")
+                    help="ALSO echo every decorated function's call (name, args) and "
+                         "return value to your CONSOLE at DEBUG on the 'antbot.calls' "
+                         "logger -- see tracing.log_call. Independent of --frame-log: that "
+                         "flag already records calls into the JSONL file regardless of "
+                         "this one; this is purely for a live glance without opening the "
+                         "viewer. Very noisy on its own; meant for hunting one bug.")
+    ap.add_argument("--frame-log", action="store_true",
+                    help="record ONE unified timeline as JSONL for the frame_viewer to "
+                         "replay: every navigate_to call's planner internals "
+                         "(find_shared_route/find_nearest_step_toward, frame by frame -- "
+                         "every node popped, every edge relaxed) AND every decorated "
+                         "function's call/return, nested and in true chronological order "
+                         "(see tracing.EventRecorder). Writes a fresh timestamped file "
+                         "under frame_logs/ -- see --frame-log-path to name it yourself.")
+    ap.add_argument("--frame-log-path", metavar="PATH", default=None,
+                    help="like --frame-log, but at a PATH you choose instead of an "
+                         "auto-generated one under frame_logs/ (implies --frame-log). "
+                         "Appends if PATH already exists -- pass a fresh name if you don't "
+                         "want an earlier run's searches mixed into this one.")
     args = ap.parse_args()
+    if args.list:
+        for t in TESTS:
+            kind = "efficiency (cold+warm scored)" if t.measure_efficiency else "pass/fail"
+            print(f"  {t.name}\n      [{kind}]")
+        return
     if args.verbose_calls:
         logging.getLogger("antbot.calls").setLevel(logging.DEBUG)
     phases = ["cold", "warm"] if args.phase == "both" else [args.phase]
-    frames = FrameLogger(args.frame_log) if args.frame_log else None
+    frame_log_path = args.frame_log_path
+    if frame_log_path is None and args.frame_log:
+        frame_log_path = _default_frame_log_path()
+    recorder = EventRecorder(frame_log_path) if frame_log_path else None
+    token = tracing.bind_recorder(recorder) if recorder is not None else None
+    if recorder is not None:
+        print(f"recording planner frames to {frame_log_path}\n"
+              f"  view with: python -m antbot.frame_viewer {frame_log_path}")
     try:
         raise SystemExit(asyncio.run(run_all(args.filter, phases, args.trace,
-                                             args.rebuild_fixture, frames=frames)))
+                                             args.rebuild_fixture)))
     finally:
-        if frames is not None:
-            frames.close()
+        if recorder is not None:
+            tracing.unbind_recorder(token)
+            recorder.close()
 
 
 if __name__ == "__main__":
