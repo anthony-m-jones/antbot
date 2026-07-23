@@ -512,7 +512,7 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
         # (below): the local walker then stops at the door rather than trying to step through a
         # tile it wrongly believes is open, and navigate_to's open-the-door branch engages.
         if phase == "warm":
-            colony.seed_known(fixture.costs, fixture.links)
+            colony.seed_known(fixture.costs, fixture.links, fixture.tiles)
         session = await gm.connect_retry(flags, ACCOUNT, PASSWORD, CHARACTER,
                                          host=HOST, login_port=LOGIN_PORT)
         session.colony = colony

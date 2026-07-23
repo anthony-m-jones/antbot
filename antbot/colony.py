@@ -966,7 +966,8 @@ class Colony:
             return dict(self._walk_cost)
 
     def seed_known(self, walk_costs: dict[tuple[int, int, int], int],
-                   links: dict[tuple[int, int, int], tuple[int, int, int]]) -> None:
+                   links: dict[tuple[int, int, int], tuple[int, int, int]],
+                   tiles: dict[tuple[int, int, int], list] | None = None) -> None:
         """Inject pre-known map knowledge directly, as if bots had already explored it.
 
         This is TEST tooling for the efficiency harness's WARM pass (see
@@ -978,6 +979,15 @@ class Colony:
 
         Additive and idempotent: tiles/links already known are left as-is, so seeding a
         colony that a cold pass already populated simply tops it up to the full reveal.
+
+        `tiles` (pass `fixture.tiles` — raw item stacks) lets this ALSO populate
+        `_step_unconfirmed`, mirroring `contribute_tiles`'s own classification exactly.
+        Without this, "full knowledge" silently meant "knows every tile is walkable" but
+        NOT "has noticed which of those tiles are recognized-but-uncrossed floor-changes"
+        — so a warm bot would walk straight into one as if it were plain ground, the exact
+        trap the unconfirmed-step-cost mechanism exists to avoid for cold. Omit `tiles`
+        (the old behavior) only if you deliberately want a colony that knows the terrain
+        but not which parts of it are gambles — not what "warm" should mean here.
         """
         with self._lock:
             for tile, speed in walk_costs.items():
@@ -990,6 +1000,16 @@ class Colony:
                 if source not in self._bad_links:
                     self._links.setdefault(source, dest)
                     self._hazards.add(source)
+            if tiles:
+                for tile, items in tiles.items():
+                    if tile in self._links:
+                        continue
+                    ids = [item_id for item_id, _count in items]
+                    hit = self.traversal.classify(ids)
+                    if hit is not None:
+                        kind = self.traversal.kind(hit[0])
+                        if kind is not None and kind.action == "step":
+                            self._step_unconfirmed.add(tile)
 
     def register_session(self, name: str, session) -> None:
         """Bind a live bot session by name, for the dashboard's packet inspector."""
