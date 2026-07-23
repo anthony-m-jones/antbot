@@ -1159,9 +1159,15 @@ async def _walk_to(session: GameSession, item_flags: ItemFlags,
         shared = session.colony.walkable_ref() if session.colony is not None else None
         registry = session.colony.traversal if session.colony is not None else None
         known_links = set(session.colony.get_links()) if session.colony is not None else None
+        # colony.get_step_unconfirmed() is GLOBAL — built from every bot's sightings, not
+        # just ours — so this catches a hazard another bot discovered even if this session
+        # has never personally seen that exact tile (see nav.find_path_toward's docstring).
+        colony_hazards = (session.colony.get_step_unconfirmed()
+                         if session.colony is not None else None)
         path = find_path_toward(session.state, item_flags, goal_x, goal_y,
                                 max_radius=plan_radius, extra_walkable=shared,
-                                registry=registry, confirmed_links=known_links)
+                                registry=registry, confirmed_links=known_links,
+                                step_unconfirmed=colony_hazards)
         # Publish the intent BEFORE acting on it, so a bot that can't plan still shows
         # the dashboard what it was reaching for. That "goal set, plan empty" state is
         # precisely what an outside observer sees as a frozen bot. `plan_source` records

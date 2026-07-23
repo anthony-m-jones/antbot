@@ -329,6 +329,7 @@ def find_path_toward(state: GameState, item_flags: ItemFlags,
                      extra_walkable: set[tuple[int, int, int]] | None = None,
                      registry=None,
                      confirmed_links: set[tuple[int, int, int]] | None = None,
+                     step_unconfirmed: set[tuple[int, int, int]] | None = None,
                      ) -> list[str] | None:
     """Path *toward* (goal_x, goal_y), even if it's beyond what we've seen.
 
@@ -367,6 +368,20 @@ def find_path_toward(state: GameState, item_flags: ItemFlags,
     silently step onto one mid-route (it's not blocking, so `is_walkable` allows it) and
     get relocated somewhere else entirely. Omit both (the default) to skip this pricing
     entirely — used by callers with no colony to consult.
+
+    `step_unconfirmed` (pass `colony.get_step_unconfirmed()`) is a SEPARATE, cheaper check
+    for the SAME kind of tile, and matters for a gap `registry`/`confirmed_links` alone
+    can't close: those two can only classify a tile whose CONTENTS are already in `state.
+    tiles` — this bot's own, private view. A tile reachable only through `extra_walkable`
+    (the colony's shared walkable set) may be a hazard some OTHER bot already discovered
+    and reported, with nothing in this bot's own view to classify at all — silently falling
+    through as ordinary ground otherwise. `colony.get_step_unconfirmed()` is already a plain
+    tile membership set (no item stack needed to consult it), built the same way for
+    `find_route`, so passing it here gives the local walker the SAME colony-wide hazard
+    awareness the shared router already has, not just what this bot personally happened to
+    see. Checked first (cheaper, and authoritative — the colony set is already maintained to
+    drop a tile the moment it's confirmed as a real link); local classification is the
+    fallback for anything only this bot has ever seen.
 
     LOGGING: emits to the `antbot.route` logger — see `find_route`'s docstring and
     `nav.route_log`.
@@ -443,15 +458,23 @@ def find_path_toward(state: GameState, item_flags: ItemFlags,
             if neighbor != goal and neighbor in occupied:
                 continue
             n_tile = (neighbor[0], neighbor[1], z)
-            gamble = False
-            if registry is not None and (confirmed_links is None or n_tile not in confirmed_links):
-                items = state.tiles.get(n_tile)
-                if items:
-                    hit = registry.classify(tile_ids(items))
-                    if hit is not None:
-                        kind = registry.kind(hit[0])
-                        if kind is not None and kind.action == "step":
-                            gamble = True
+            # Colony-wide knowledge first (cheap membership test, no item stack needed —
+            # this is what catches a hazard some OTHER bot discovered that THIS bot has
+            # never personally seen). Fall back to classifying our OWN view for anything
+            # only we have laid eyes on, which the shared set wouldn't know about yet.
+            if step_unconfirmed is not None and n_tile in step_unconfirmed:
+                gamble = True
+            else:
+                gamble = False
+                if (registry is not None
+                        and (confirmed_links is None or n_tile not in confirmed_links)):
+                    items = state.tiles.get(n_tile)
+                    if items:
+                        hit = registry.classify(tile_ids(items))
+                        if hit is not None:
+                            kind = registry.kind(hit[0])
+                            if kind is not None and kind.action == "step":
+                                gamble = True
             step = (unconfirmed_step_cost(n_tile, goal_x, goal_y) if gamble
                    else tile_cost(state, item_flags, neighbor[0], neighbor[1], z))
             nd = cost + step

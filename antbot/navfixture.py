@@ -227,10 +227,17 @@ async def build(item_flags: ItemFlags, name: str, start: Tile, dest: Tile,
         walkable = colony.get_walkable()
         links = colony.get_links()
         costs = colony.get_walk_costs()
+        # Any STEP-type object the reveal SAW but the real navigate above never actually
+        # crossed (so it's not in `links`) must be priced the same honest, non-free way the
+        # live router prices it — otherwise the solver can route the "optimal" path straight
+        # through an object that would really relocate you, freezing a par_cost no bot could
+        # actually achieve. See navcost.optimal's docstring.
+        step_unconfirmed = colony.get_step_unconfirmed()
         # The destination sits behind the (now open) door, so its tile is walkable in the
         # reveal. If it somehow isn't reachable, the reveal was incomplete — surface that
         # rather than freezing a bogus floor.
-        solved = navcost.optimal(walkable, links, costs, start, dest)
+        solved = navcost.optimal(walkable, links, costs, start, dest,
+                                 step_unconfirmed=step_unconfirmed)
         if solved is None:
             result["error"] = (
                 f"could not solve an optimal route {start} -> {dest} over the revealed "

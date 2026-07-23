@@ -119,7 +119,8 @@ def route_cost(path: Sequence[Tile], cost_of: Callable[[Tile], int]) -> int:
 
 
 def optimal(walkable: set[Tile], links: dict[Tile, Tile], costs: Mapping[Tile, int],
-            start: Tile, dest: Tile, reach: int = 0) -> tuple[int, list[Tile]] | None:
+            start: Tile, dest: Tile, reach: int = 0,
+            step_unconfirmed: set[Tile] | None = None) -> tuple[int, list[Tile]] | None:
     """The time-optimal route from `start` to `dest` over a fully-revealed map — the FLOOR.
 
     Delegates the search to nav.find_route (weighted Dijkstra over the shared walkable graph
@@ -132,8 +133,22 @@ def optimal(walkable: set[Tile], links: dict[Tile, Tile], costs: Mapping[Tile, i
     The map must be revealed with any blocking-but-openable obstacle (a door) already OPEN,
     so `walkable` includes its tile; find_route then routes through it like any other ground
     and both floor and score pay its ground cost. See the module docstring.
+
+    `step_unconfirmed` (pass `colony.get_step_unconfirmed()` from the SAME reveal) matters
+    whenever the revealed region contains a STEP-type floor-change (a hole/stairs/teleporter)
+    that was only ever SEEN during the reveal, never actually crossed into a confirmed link.
+    Without this, find_route has no idea that tile isn't ordinary ground and can route the
+    "optimal" path straight through it — reporting a floor that isn't actually achievable,
+    since in reality stepping there relocates you somewhere the solver never accounted for.
+    Passing it makes the floor solved with the EXACT same honesty the live router uses (see
+    nav.unconfirmed_step_cost): a route that avoids the object wins if it's genuinely cheaper,
+    but the object is never silently treated as free passage. This was a real bug — a test
+    region with such an object froze a par_cost lower than any bot (cold OR warm) could
+    actually achieve, since both correctly refuse to gamble through it. Omitting this
+    (the old behavior) is only correct for a region with no such loose ends.
     """
-    route = find_route(walkable, links, start, dest, reach=reach, costs=dict(costs))
+    route = find_route(walkable, links, start, dest, reach=reach, costs=dict(costs),
+                       step_unconfirmed=step_unconfirmed)
     if route is None:
         return None
     # find_route yields (direction, is_teleport, landing) per step; the tiles we STAND on
