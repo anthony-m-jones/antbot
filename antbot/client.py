@@ -19,7 +19,9 @@ import dataclasses
 import logging
 import random
 import struct
+import threading
 import time
+from collections import deque
 
 from . import wire
 from .items import ItemFlags
@@ -77,6 +79,9 @@ _MIN_SEND_INTERVAL = 0.08
 # How many server status lines a session keeps (see GameSession.messages). Enough to
 # cover the handful of frames around one action; we only ever read the recent tail.
 _MESSAGE_TAIL = 20
+# How many recent frames the packet inspector keeps per captured bot (each ~a few
+# hundred bytes). Bounded so live capture can't grow without limit; old frames drop.
+_FRAME_LOG_MAX = 400
 
 
 def inventory_pos(slot: int) -> tuple[int, int, int]:
@@ -201,10 +206,30 @@ class GameSession:
         # narrates every refusal here and nowhere else, so when a move quietly does
         # nothing this is the only place that says why.
         self.messages: list[tuple[int, str]] = []
+        # A live trace of the behaviour's recent DECISIONS (phase + why), so the dashboard
+        # can show the bot's "brain", not just its body. This is what makes a silly loop
+        # visible: you watch the same few decisions repeat. Bounded ring.
+        self.decisions: deque[tuple[float, str, str]] = deque(maxlen=30)
         # opcode -> how many frames we bailed on it. Bails mean "an opcode we don't parse
         # yet"; each is a candidate for a consume handler (see world.py). Recorded once
         # per opcode into the session (recorder.event) and summarised on close.
         self._bail_counts: dict[int, int] = {}
+        # Packet inspector (learning tool). OFF by default and per-bot: when scaled up,
+        # every bot runs with this false and pays only one bool check per frame. Enabled
+        # from the dashboard on the bot you're studying. We store the RAW plaintext bytes
+        # (already in hand — the decrypt output for rx, the pre-frame payload for tx) in a
+        # bounded ring; NO decoding happens here (that's view-time only, off the hot path).
+        # Credentials never enter it: rx capture is post-login, tx capture is gated on
+        # `connected` so the password-bearing login packet is skipped.
+        self.capture_frames = False
+        # (seq, wall_time, "rx"|"tx", payload). The seq is a stable id even as the ring
+        # rotates, so the dashboard can reference a frame that's still in the buffer.
+        self.frame_log: deque[tuple[int, float, str, bytes]] = deque(maxlen=_FRAME_LOG_MAX)
+        self._frame_seq = 0
+        # Guards frame_log for cross-thread reads: the bot appends on the asyncio loop,
+        # the dashboard reads from its HTTP thread. Taken ONLY while capturing (per-bot,
+        # opt-in), so uncaptured bots — every bot at scale — never touch it.
+        self._frame_lock = threading.Lock()
         # What this bot is currently TRYING to do, for the dashboard's intent overlay.
         # `goal` is where it wants to be; `plan` is the route it worked out to get there.
         # An empty `plan` with a `goal` set is the interesting state: the bot wants to go
@@ -213,6 +238,15 @@ class GameSession:
         # stuck" into "the bot is trying to reach THAT tile and can't".
         self.goal: tuple[int, int, int] | None = None
         self.plan: list[tuple[int, int, int]] = []
+        # The monster we're currently auto-attacking (server-side target set via 0xA1), or
+        # None. Tracked so `_engage_adjacent` only sends a packet when the target CHANGES
+        # instead of every round — see that function.
+        self.attack_target: int | None = None
+        # Which planner produced the current `plan` (or last failed to): "shared" =
+        # find_route over the colony map (travel/_walk_shared), "local" = the myopic
+        # find_path_toward over this bot's own view (_walk_to). Surfaced on the dashboard
+        # so a stuck bot tells us WHICH pathfinder is at fault, not just that it's stuck.
+        self.plan_source: str = ""
         # Pickup tiles THIS bot has failed to walk to -> when to forgive them
         # (monotonic). Stops us re-claiming a pile we just proved we can't reach; the
         # task itself stays open for a bot better placed to try. Expires because the
@@ -242,6 +276,12 @@ class GameSession:
         # Optional session recorder (see recorder.py). When set, capture points push
         # snapshots/actions/decisions/events for later replay. None = not recording.
         self.recorder = None
+        # Optional path recorder for the efficiency tests (see navcost / navtests). When set
+        # to a list, the receive loop appends our Position after every CONFIRMED own-move, so
+        # the harness gets the exact tile-by-tile route the bot walked — including any
+        # backtracking — to price against the time-optimal floor. None (the default) for
+        # every normal bot, so this costs nothing at scale: it's operator/test tooling only.
+        self.path_log: list | None = None
         # Container ids that are BROWSE FIELDS (a ground tile the server wrapped in a
         # container for us, see browse_field) rather than a bag we carry. They arrive as
         # ordinary containers, so without this a hauler could mistake a tile for its
@@ -257,6 +297,10 @@ class GameSession:
         # for too long treats the bot as stuck and takes corrective action.
         self.last_move_time = time.monotonic()
         self.last_frame_time = time.monotonic()
+        # When we last reported to the colony. The per-move report keeps a WALKING bot
+        # fresh; this lets the frame loop add a slow heartbeat so a STUCK bot keeps
+        # reporting too (see _REPORT_HEARTBEAT).
+        self.last_report_time = 0.0
         self.last_block_clear = time.monotonic()  # when the stuck watchdog last cleared blocks
         # Outbound-packet rate limiter (see _MIN_SEND_INTERVAL). The lock serialises
         # sends across the behaviour loop and the ping loop so the pacing is honoured
@@ -264,11 +308,44 @@ class GameSession:
         self._send_lock = asyncio.Lock()
         self._last_send = 0.0
 
+    # -- packet inspector (see _FRAME_LOG_MAX / packet_decode) --------------
+    def _capture(self, payload: bytes, direction: str) -> None:
+        """Record one plaintext frame. Called only while capturing; keeps a reference to
+        bytes that already exist (no copy/decode) under the cross-thread lock."""
+        with self._frame_lock:
+            self._frame_seq += 1
+            self.frame_log.append((self._frame_seq, time.time(), direction, payload))
+
+    def set_capture(self, on: bool) -> None:
+        """Turn the inspector on/off for this bot (from the dashboard). Off clears the
+        buffer so a later capture starts clean."""
+        self.capture_frames = on
+        if not on:
+            with self._frame_lock:
+                self.frame_log.clear()
+
+    def frames_raw(self) -> list[tuple[int, float, str, bytes]]:
+        """A snapshot of the buffered (seq, t, dir, payload) tuples, taken under the lock
+        so a concurrent append can't corrupt the cross-thread read."""
+        with self._frame_lock:
+            return list(self.frame_log)
+
+    def frame_by_seq(self, seq: int) -> tuple[str, bytes] | None:
+        """(dir, payload) for one buffered frame by its stable seq, or None if aged out."""
+        with self._frame_lock:
+            for s, _t, d, p in self.frame_log:
+                if s == seq:
+                    return (d, p)
+        return None
+
     def _report_to_colony(self) -> None:
         """Push our position + vitals + newly-explored tiles up, and pull shared
         hazards down."""
         if self.colony is None:
             return
+        # Make this live session reachable by name so the dashboard can toggle packet
+        # capture and read frames. Idempotent; the latest session per name wins (relogs).
+        self.colony.register_session(self.bot_name, self)
         s = self.state
         # Runtime blocks with remaining TTL, for the dashboard's block-inspector overlay.
         # These are tiles the SERVER refused us at runtime — the layer that accumulates
@@ -291,8 +368,21 @@ class GameSession:
                                hp=s.hp, max_hp=s.max_hp, mana=s.mana,
                                max_mana=s.max_mana, level=s.level, role=self.role,
                                goal=self.goal, plan=self.plan,
-                               blocked=blocked, creatures=creatures)
+                               plan_source=self.plan_source,
+                               blocked=blocked, creatures=creatures,
+                               decisions=list(self.decisions),
+                               # Creature-tracking health: moves we couldn't attribute to
+                               # a known creature (each = a monster frozen at a stale tile)
+                               # and stale records we cleared. See _relocate_creature.
+                               tracking={"move_misses": s.creature_move_misses,
+                                         "ghosts": s.creature_ghosts_dropped})
         self.colony.contribute_tiles(self.state)
+        # Timestamp every report so the frame loop's heartbeat (see _run_read_loop) knows
+        # when we last told the dashboard anything. A moving bot reports on every step;
+        # this is what lets a STUCK bot keep reporting too, so monsters that walk up to a
+        # boxed-in scout still appear on the map instead of the view freezing at its last
+        # step.
+        self.last_report_time = time.monotonic()
         # Share any loot we can see, so the swarm's eyes feed every hauler.
         _scan_loot(self)
         # Learn the hazards other bots have discovered, so we avoid exits we
@@ -308,6 +398,17 @@ class GameSession:
             self.colony.log_event(self.bot_name, level, category, message, self.state.position)
         if self.recorder is not None:
             self.recorder.event(level, category, message)
+
+    def decide(self, phase: str, why: str = "") -> None:
+        """Record a behaviour decision — sets the visible `status` AND appends to the live
+        decision trace (see `self.decisions`). `phase` is the short label the roster shows
+        ('scouting', 'breaking out', 'descending', 'loop-break', …); `why` is the reason
+        that makes a loop legible ('-> frontier (x,y,z)', '3 monsters adjacent', …).
+        """
+        self.status = f"{phase}: {why}" if why else phase
+        self.decisions.append((time.time(), phase, why))
+        if self.recorder is not None:
+            self.recorder.decision(phase, why=why)
 
     async def connect(self) -> None:
         self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
@@ -392,7 +493,13 @@ class GameSession:
             if wait > 0:
                 await asyncio.sleep(wait)
             self._last_send = time.monotonic()
-            self.writer.write(wire.frame_xtea(msg.bytes(), self.xtea_key))
+            payload = msg.bytes()
+            # Packet inspector: capture the plaintext we send (opcode + fields), gated on
+            # `connected` so the login packet — the only one carrying credentials — is
+            # never captured. Off by default; one bool check otherwise.
+            if self.capture_frames and self.connected.is_set():
+                self._capture(payload, "tx")
+            self.writer.write(wire.frame_xtea(payload, self.xtea_key))
             await self.writer.drain()
 
     async def use_item(self, x: int, y: int, z: int, item_id: int,
@@ -496,6 +603,8 @@ class GameSession:
                     self._inspect(payload)
                 else:
                     # Ongoing frames: keep position/map/creatures live.
+                    if self.capture_frames:      # packet inspector (off by default)
+                        self._capture(payload, "rx")
                     result = process_world_frame(payload, self.state, self.item_flags)
                     if result.messages:
                         # The server only ever explains a refused action in prose, so
@@ -503,6 +612,11 @@ class GameSession:
                         # this is a diagnostic tail, not a chat log.
                         self.messages.extend(result.messages)
                         del self.messages[:-_MESSAGE_TAIL]
+                    if result.target_cancelled:
+                        # The server dropped our attack target (almost always: it died).
+                        # Forget it, or `_engage_adjacent` would compare against a target
+                        # that no longer exists and skip re-targeting the next monster.
+                        self.attack_target = None
                     if result.moved or result.rejected:
                         self.last_rejected = result.rejected
                         self.move_event.set()
@@ -511,6 +625,20 @@ class GameSession:
                             # We changed tiles: refresh the dashboard's view of us
                             # and hand it whatever new map we revealed this step.
                             self._report_to_colony()
+                            # Efficiency tests: record the exact tile we landed on, once
+                            # per confirmed move (see navcost). This is the single choke
+                            # point every real step passes through, so the captured route
+                            # can't miss or double-count a step. Off (None) for normal bots.
+                            if self.path_log is not None and self.state.position is not None:
+                                self.path_log.append(self.state.position)
+                    # Heartbeat: report even when we DIDN'T move, so a boxed-in bot keeps
+                    # its dashboard view live. Frames keep arriving while stuck (creatures
+                    # move around us, the world light ticks), so this fires reliably; the
+                    # per-move report above resets last_report_time, so this never double-
+                    # reports for a walking bot. This is the fix for "stuck bot with an
+                    # invisible monster": the monster IS tracked, we just weren't reporting.
+                    if time.monotonic() - self.last_report_time >= _REPORT_HEARTBEAT:
+                        self._report_to_colony()
                     if result.bailed_opcode is not None:
                         log.debug("frame: unhandled opcode %#04x (resyncing next frame)",
                                   result.bailed_opcode)
@@ -755,6 +883,14 @@ async def path_session(host: str, login_port: int, account: str, password: str,
 
 # Watchdog thresholds (seconds).
 _STALL_SECONDS = 20    # no data from the server at all -> connection is dead
+# How often a NON-moving bot re-reports to the colony. A walking bot reports on every
+# step (see the frame loop); this bounds the extra reports for a stuck/idle bot to keep
+# the dashboard's view of it — position, vitals, and the CREATURES around it — fresh
+# without spamming. 1s is far slower than a walking bot already reports, so it adds no
+# load at scale; it exists purely so a boxed-in bot doesn't vanish from the live view
+# (and take the monster that trapped it with it).
+_REPORT_HEARTBEAT = 1.0
+
 _STUCK_SECONDS = 25    # alive but not moving -> probably boxed in by stale blocks
 _RELOG_STUCK_SECONDS = 90  # alive but STILL not moving this long -> force a relog
                            # (fresh connection; clears server-side flood throttling)
@@ -786,6 +922,13 @@ def _prune_blocked_tiles(session: GameSession) -> None:
 # `max_radius`). Comfortably larger than the wanderer's home radius so it can still
 # route around walls. goto/travel pass None instead (exact long-distance routing).
 _PLAN_RADIUS = 40
+# Failed travel attempts at one shared frontier before a scout retires it (leak into a
+# sealed room, or a link it can't execute). Low so we stop wasting trips quickly.
+_FRONTIER_MAX_TRIES = 3
+# How long a scout may reveal NO new map before the loop-breaker sends it home to the
+# temple for a clean restart. Long enough not to trip on a slow-but-real approach; short
+# enough that a genuine loop doesn't grind for minutes.
+_LOOP_BREAK_SECONDS = 60.0
 
 # How near an untried use-object (ladder/hole/grate/door) has to be for a scout to
 # detour and try it before falling back to a known step-descent. Small, so we only
@@ -804,6 +947,35 @@ _ONSIGHT_RADIUS = 6
 # radius because the common case is a scout stranded on a small upper platform after
 # climbing a ladder, where the way back down is the hole right next to where it landed.
 _DESCENT_RADIUS = 30
+
+# How long `scout` lets ONE `navigate_to` call try before giving control back to its own
+# round loop. Scout picks WHERE to go (a frontier, a learned shortcut, home); `navigate_to`
+# owns HOW to get there (open a door, hunt a floor change) — see navigate_to's docstring.
+# A bound is essential here: unlike the nav tests (which want navigate_to to keep retrying
+# until arrival or a real deadline), scout must stay responsive every round to its OWN
+# stuck-counting, boxed-in escape, and self-defence — logic navigate_to knows nothing
+# about. A few seconds is enough for one honest attempt without starving those checks.
+_SCOUT_NAV_BUDGET = 8.0
+
+# Consecutive `navigate_to` rounds with NO net movement before it considers the block
+# might be a MONSTER (or a stale crowd) worth fighting/stepping through rather than just
+# re-planning around forever. A monster occupies its tile transiently (never durably
+# blocked — see _walk_to's "rejected" handling), so a corridor with one rat in it can
+# otherwise make navigate_to spin indefinitely: replan, get rejected, replan, forever.
+# Set low relative to scout's own 8-round threshold because one navigate_to round is
+# already a full _walk_to attempt (up to 60 steps) or a travel() hop — several of those
+# producing zero progress is a much stronger "genuinely blocked" signal than one scout tick.
+_NAV_FIGHT_THRESHOLD = 3
+
+# How long an attempted-but-unresolved exit object (a door we used, a hole we tried to
+# step onto) stays on the "already tried" list before we'll attempt it again. The old
+# behaviour retired an object for the WHOLE session on that floor, so a single
+# transient failure — a creature blocking the doorway that round, a step that didn't
+# register, the launch tile briefly unreachable — permanently abandoned that exit and
+# left the scout to random-walk the room forever. A TTL lets a real dead-end stay
+# retired long enough not to thrash, while giving a fluke another chance. (Mirrors how
+# _BLOCK_TTL forgives transient tile rejections.)
+_TRIED_TTL = 45.0
 
 # How close another bot must be to a shortcut's LANDING for a scout to consider that
 # landing "taken" and pick a different exit. All scouts share one colony link graph, so
@@ -973,16 +1145,31 @@ async def _walk_to(session: GameSession, item_flags: ItemFlags,
             log.info("arrived at %s", pos)
             return True
 
+        # Hit back while we walk. A bot spends most of its life inside this loop, not in
+        # the scout round, so without this a monster could chase and chew on us the whole
+        # way to a goal and we'd never swing. Costs a packet only when the target changes.
+        await _engage_adjacent(session)
+
         # Plan toward the goal over the *known* map. When the goal is still beyond
         # what we've seen, this heads for the reachable tile closest to it; each
-        # chunk scrolls more map in, so the next plan reaches further (B3).
+        # chunk scrolls more map in, so the next plan reaches further (B3). We hand it
+        # the colony's shared walkable set too, so the flood can cross ground a teammate
+        # mapped (or that we saw before relogging) instead of dead-ending on our private
+        # view — see find_path_toward's `extra_walkable`.
+        shared = session.colony.walkable_ref() if session.colony is not None else None
+        registry = session.colony.traversal if session.colony is not None else None
+        known_links = set(session.colony.get_links()) if session.colony is not None else None
         path = find_path_toward(session.state, item_flags, goal_x, goal_y,
-                                max_radius=plan_radius)
+                                max_radius=plan_radius, extra_walkable=shared,
+                                registry=registry, confirmed_links=known_links)
         # Publish the intent BEFORE acting on it, so a bot that can't plan still shows
         # the dashboard what it was reaching for. That "goal set, plan empty" state is
-        # precisely what an outside observer sees as a frozen bot.
+        # precisely what an outside observer sees as a frozen bot. `plan_source` records
+        # WHICH planner is steering (this is the myopic local one) so the dashboard can
+        # show which path is producing a given decision or failure.
         session.goal = (goal_x, goal_y, pos.z)
         session.plan = _path_tiles(pos, path) if path else []
+        session.plan_source = "local"
         if not path:
             log.info("stuck: cannot get closer to (%d, %d) from %s", goal_x, goal_y, pos)
             session._report_to_colony()   # make the failed attempt visible
@@ -1144,14 +1331,20 @@ async def _walk_shared(session: GameSession, item_flags: ItemFlags,
         # owns shortcut traversal, because stepping onto a teleport needs a raw step
         # and a re-plan afterwards. Passing links here would produce a route whose
         # directions we'd then walk straight into a stairwell.
+        # Hit back while we walk — same reason as in `_walk_to`: this loop is where the
+        # time goes, so self-defence has to live here too, not only in the scout round.
+        await _engage_adjacent(session)
+
         # Let transient blocks lapse first, so a bot that stepped into our path once
         # doesn't leave a permanent phantom wall in the route planner.
         _prune_blocked_tiles(session)
         avoid = colony.get_hazards() | set(session.state.blocked_tiles)
         route = find_route(colony.get_walkable(), {}, here, goal, reach=reach,
-                           avoid=avoid, costs=colony.get_walk_costs())
+                           avoid=avoid, costs=colony.get_walk_costs(),
+                           step_unconfirmed=colony.get_step_unconfirmed())
         session.goal = goal
         session.plan = [landing for _dir, _tp, landing in route] if route else []
+        session.plan_source = "shared"   # find_route over the colony map
         if not route:
             # Either we're there (handled above) or the shared map doesn't connect us.
             session._report_to_colony()
@@ -1241,13 +1434,54 @@ def _adjacent_monsters(session: GameSession) -> list:
     return out
 
 
+async def _engage_adjacent(session: GameSession) -> bool:
+    """Melee whatever monster is standing next to us. Cheap, non-blocking, every round.
+
+    This is SELF-DEFENCE, and it's deliberately separate from `_fight_free` (which is an
+    escape tool that only runs once a scout has been immobile for 8 straight rounds). A
+    bot being chewed on while it's still walking never trips that counter, so before this
+    existed a scout would take a beating the whole way across a map and never swing back.
+
+    The trick that makes running this every round free: 0xA1 sets a PERSISTENT server-side
+    attack target — the server keeps swinging every turn while we're adjacent (see
+    `attack`). So we don't re-send anything while the fight is going; we only send a packet
+    when the target actually CHANGES. In a steady fight that's one packet per kill, which
+    keeps us far under Canary's flood cutoff even with a large swarm, and it never blocks
+    the caller, so exploration continues while the server does the melee.
+
+    We also FOCUS FIRE: once locked onto a monster we stay on it while it's still next to
+    us, rather than re-picking the weakest each round (their HP changes as we hit them,
+    which would otherwise make us flip targets constantly and spam re-target packets).
+
+    Returns True if we're engaged with something.
+    """
+    adj = _adjacent_monsters(session)
+    if not adj:
+        # Nothing next to us any more — drop the auto-attack so we don't stay locked on
+        # a creature that died or wandered off.
+        if session.attack_target is not None:
+            await session.attack(0)
+            session.attack_target = None
+        return False
+    # Still fighting the same monster? The server is already swinging — send nothing.
+    if any(c.creature_id == session.attack_target for c in adj):
+        return True
+    target = adj[0]                      # _adjacent_monsters sorts weakest first
+    await session.attack(target.creature_id)
+    session.attack_target = target.creature_id
+    log.debug("engaging %s (%d%% hp); %d adjacent",
+              target.name or "monster", target.health_percent, len(adj))
+    return True
+
+
 # How long we'll keep meleeing our way out before giving up this bout (seconds). A
 # bounded fight: if we can't clear a path in this window, fall back to the normal escape
 # chain rather than swing forever.
 _FIGHT_FREE_SECONDS = 12.0
 
 
-async def _fight_free(session: GameSession, item_flags: ItemFlags) -> bool:
+async def _fight_free(session: GameSession, item_flags: ItemFlags,
+                      max_seconds: float | None = None) -> bool:
     """Boxed in by MONSTERS: melee them until a tile opens, then let the caller re-plan.
 
     Only called when we're already stuck and can't step out — so there's nowhere to flee
@@ -1255,13 +1489,19 @@ async def _fight_free(session: GameSession, item_flags: ItemFlags) -> bool:
     monster). We target the weakest adjacent monster, let the server auto-melee, and stop
     the moment ANY neighbour becomes walkable (a monster died or wandered off). Returns
     True if we opened a path.
+
+    `max_seconds` caps the bout below the usual `_FIGHT_FREE_SECONDS` — a time-boxed
+    caller (`navigate_to` with a `deadline`) passes whatever's left of its own budget, so
+    a fight can't run the caller past a deadline it promised to respect. None uses the
+    default.
     """
     from .nav import is_walkable
     if not _adjacent_monsters(session):
         return False    # not a monster problem — leave it to the normal escape chain
 
     loop = asyncio.get_event_loop()
-    deadline = loop.time() + _FIGHT_FREE_SECONDS
+    budget = _FIGHT_FREE_SECONDS if max_seconds is None else max(0.0, max_seconds)
+    deadline = loop.time() + budget
     session.status = "fighting free"
     session.expect_movement = False   # standing and swinging is intended; don't relog us
     target = None
@@ -1270,23 +1510,44 @@ async def _fight_free(session: GameSession, item_flags: ItemFlags) -> bool:
         p = session.state.position
         if p is None:
             return False
-        # Did a way out open? (a monster died or moved) -> done, let the caller walk it.
-        for name, (dx, dy) in DIRECTION_DELTAS.items():
-            if is_walkable(session.state, item_flags, p.x + dx, p.y + dy, p.z):
-                session.expect_movement = True
-                return True
+        # Tiles a creature occupies RIGHT NOW. A monster stands on walkable floor, and we
+        # never add creature-occupied tiles to blocked_tiles, so is_walkable reports the
+        # rat's own tile as a free exit — the original bug: _fight_free saw a "way out"
+        # and returned before ever swinging. A tile is only a real exit if it's walkable
+        # AND nothing is standing on it. (ignore_blocked: judge terrain + occupancy, not
+        # our stale block map, so a tile that just cleared isn't hidden by an old block.)
+        occupied = {(c.position.x, c.position.y)
+                    for c in session.state.creatures.values()
+                    if c.position is not None and c.position.z == p.z
+                    and c.creature_id != session.state.player_id}
+        opened = any(
+            (p.x + dx, p.y + dy) not in occupied
+            and is_walkable(session.state, item_flags, p.x + dx, p.y + dy, p.z,
+                            ignore_blocked=True)
+            for _name, (dx, dy) in DIRECTION_DELTAS.items())
+        if opened:                       # a monster died or wandered off -> go
+            session.expect_movement = True
+            return True
         adj = _adjacent_monsters(session)
         if not adj:
             session.expect_movement = True
             return True     # nothing adjacent to fight and (checked above) a tile's open
         # (Re)issue the attack on the weakest adjacent monster. Re-target if ours died.
+        # Keep `session.attack_target` in step: `_engage_adjacent` runs every round too and
+        # decides whether to send a packet by comparing against it, so if we changed the
+        # server's target behind its back the two would keep overwriting each other.
         weakest = adj[0]
         if target != weakest.creature_id:
             target = weakest.creature_id
+            session.log_event("info", "combat",
+                              f"boxed in — meleeing {weakest.name or 'monster'} "
+                              f"({weakest.health_percent}% hp); {len(adj)} adjacent")
             await session.attack(target)
+            session.attack_target = target
         await asyncio.sleep(1.0)   # a melee swing lands roughly this often
     session.expect_movement = True
     await session.attack(0)        # stop attacking when we give up the bout
+    session.attack_target = None
     return False
 
 
@@ -1384,6 +1645,21 @@ async def _perform_traversal(session: GameSession, source: tuple[int, int, int],
         # a normal 0x6D step), so we can't wait on move_event — give it a moment and
         # then read our position.
         await asyncio.sleep(0.35)
+        # Grates are ambiguous and we can't tell statically (see traversal.seed_by_name):
+        # some are USE objects, others are step-teleports baked into the map. If USE
+        # didn't move us, STEP onto it — and if THAT moves us, relearn the id as the step
+        # object it actually is, so future routing steps onto it instead of uselessly
+        # "using" it. This is what makes "try grates on sight" work for either mechanism.
+        if category == "grate":
+            here = session.state.position
+            if here is not None and (here.x, here.y, here.z) == (before.x, before.y, before.z):
+                await _raw_step(session, direction)
+                stepped = session.state.position
+                if (stepped is not None and reg is not None
+                        and (stepped.x, stepped.y, stepped.z) != (before.x, before.y, before.z)):
+                    from .traversal import category_from_relocation
+                    xy = abs(stepped.x - before.x) + abs(stepped.y - before.y)
+                    reg.learn(item_id, category_from_relocation(before.z, stepped.z, xy))
     elif kind.action == USE_WITH:
         # Use a carried tool ON the object (shovel-on-hole, machete-on-grass). Look
         # up the required tool in our inventory (now that we parse it); if we don't
@@ -1439,10 +1715,67 @@ async def _take_shortcut(session: GameSession, source: tuple[int, int, int],
     await _raw_step(session, direction)
 
 
+def _live_tried(tried: dict, now: float) -> set:
+    """Prune expired 'already tried' entries and return the still-cooling-down tile set.
+
+    The exit-object seekers keep a {tile: retry_time} map (see _TRIED_TTL): drop any whose
+    retry time has arrived (so a fluke failure gets reconsidered), and hand back the tiles
+    still on cooldown as a plain set for the finders' `skip` argument.
+    """
+    for t in [t for t, exp in tried.items() if now >= exp]:
+        del tried[t]
+    return set(tried)
+
+
+# Door categories: objects we OPEN. Directed navigation restricts _try_use_object to these
+# (a door clears the way) — it must never "use" a ladder/grate mid-route, which relocates
+# us off our path. The scout, hunting any exit, passes only=None.
+_DOOR_CATEGORIES = {"door_unlocked", "door_locked"}
+
+
+async def _reach_and_use(session: GameSession, item_flags: ItemFlags, found,
+                         max_steps: int = 40):
+    """Get beside a found USE-object and use it — the ONE 'walk up to a thing and use it'
+    path, shared by the scout's exit hunt and directed navigation so their adjacency
+    handling can't drift apart. `found` is `find_use_object`'s tuple (source, item_id,
+    category, launch, direction). Returns the Position we landed at IF using it relocated
+    us (a ladder/grate shortcut), else None.
+
+    We only need to be ADJACENT: `use_item` works from any of the eight surrounding tiles,
+    and — crucially for a SHUT door — `find_use_object` can hand back a `launch` on the FAR
+    side of the object, which is unreachable through it. So when we're already beside the
+    object we don't chase `launch`. When we open a DOOR (used, no relocation) we also
+    optimistically treat its tile as passable, so the pather routes through it immediately
+    in case the server's transform (closed->open) update is still in flight; a still-shut
+    door simply re-blocks on the next rejected step.
+    """
+    source, item_id, category, launch, direction = found
+
+    def beside(p) -> bool:
+        return (p is not None and p.z == source[2]
+                and max(abs(p.x - source[0]), abs(p.y - source[1])) == 1)
+
+    if not beside(session.state.position):
+        await _walk_to(session, item_flags, launch[0], launch[1],
+                       max_steps=max_steps, plan_radius=_PLAN_RADIUS)
+        if not beside(session.state.position):
+            return None   # couldn't get beside it this lap
+
+    session.status = f"using {category}"
+    landing = await _perform_traversal(session, source, direction, category, item_id)
+    if landing is None and category in _DOOR_CATEGORIES:
+        items = session.state.tiles.get(source)
+        if items:
+            session.state.tiles[source] = [(i, c) for (i, c) in items if i != item_id]
+        session.state.blocked_tiles.discard(source)
+        session.state.blocked_expiry.pop(source, None)
+    return landing
+
+
 async def _try_use_object(session: GameSession, item_flags: ItemFlags,
-                          tried: set[tuple[int, int, int]],
-                          max_dist: int | None = None) -> bool:
-    """Scout helper: walk to the nearest known use-object and traverse it.
+                          tried: dict, max_dist: int | None = None,
+                          only: set[str] | None = None) -> bool:
+    """Walk to the nearest known use-object and traverse it.
 
     This is what turns the catalog's seeded knowledge into real, routable shortcuts:
     a scout looks for a ladder/grate/hole/door it has seen, walks up to it, and USES
@@ -1451,9 +1784,11 @@ async def _try_use_object(session: GameSession, item_flags: ItemFlags,
     `_take_shortcut`). Using a DOOR opens it, unblocking a path the pather previously
     treated as a wall.
 
-    `tried` remembers objects we've already attempted this run so we don't hammer the
-    same one. `max_dist` caps how far we'll detour to a candidate (the scout tries
-    NEARBY objects proactively, so it wants a small radius). Returns True if we
+    `only` restricts to those categories — directed navigation passes {door categories}
+    so it opens a blocking door but never "uses" a ladder/grate that would relocate it.
+    `tried` maps a recently-attempted object tile -> when we'll try it again, so we don't
+    hammer the same one, but ALSO don't abandon it forever after one fluke (see
+    _TRIED_TTL). `max_dist` caps how far we'll detour to a candidate. Returns True if we
     attempted an object, False if there was nothing to try.
     """
     from .nav import find_use_object
@@ -1461,26 +1796,15 @@ async def _try_use_object(session: GameSession, item_flags: ItemFlags,
     colony = session.colony
     if colony is None:
         return False
+    now = time.monotonic()
     found = find_use_object(session.state, item_flags, colony.traversal,
-                            skip=tried, max_dist=max_dist)
+                            skip=_live_tried(tried, now), max_dist=max_dist, only=only)
     if found is None:
         return False
 
-    source, item_id, category, launch, direction = found
-    tried.add(source)  # attempted — don't retry endlessly even if it doesn't pan out
-
-    pos = session.state.position
-    if pos is None:
-        return False
-    if (pos.x, pos.y) != (launch[0], launch[1]):
-        await _walk_to(session, item_flags, launch[0], launch[1],
-                       max_steps=40, plan_radius=_PLAN_RADIUS)
-        pos = session.state.position
-        if pos is None or (pos.x, pos.y) != (launch[0], launch[1]):
-            return True  # couldn't get to it; count as tried and move on
-
-    session.status = f"using {category}"
-    landing = await _perform_traversal(session, source, direction, category, item_id)
+    source, category = found[0], found[2]
+    tried[source] = now + _TRIED_TTL    # attempted — hold off, but retry after the TTL
+    landing = await _reach_and_use(session, item_flags, found)
     if landing is not None:
         colony.report_link(source, (landing.x, landing.y, landing.z))
         session.log_event("info", "traversal",
@@ -1490,24 +1814,25 @@ async def _try_use_object(session: GameSession, item_flags: ItemFlags,
 
 
 async def _try_descend(session: GameSession, item_flags: ItemFlags,
-                       tried: set[tuple[int, int, int]],
-                       max_dist: int | None = None) -> bool:
-    """Scout helper: find a nearby STEP-DOWN object and fall through to descend.
+                       tried: dict,
+                       max_dist: int | None = None, direction: str = "down") -> bool:
+    """Scout helper: find a nearby STEP floor-change in `direction` and take it.
 
-    This is the counterpart to `_try_use_object` for going DOWN, and it closes a real
-    gap: a scout that climbs UP a ladder gets no learned link back down, and it can't
-    stumble down the hole by accident either — once anything falls through a hole we
-    blacklist that tile as a hazard, so the pather routes AROUND it forever. So a bot
-    strands itself on the upper floor. Here it deliberately hunts the "ladder hole
-    down" (a `hole_open`/trapdoor/down-stairs, all STEP + direction down) and steps
-    onto it on purpose. If that drops us we record the source->destination link so the
-    colony can route the descent directly next time.
+    The counterpart to `_try_use_object` for the STEP floor-changes it skips, closing two
+    real gaps. DOWN: a scout that climbs UP a ladder gets no learned link back down and
+    can't stumble down the hole by accident (we blacklist a fallen-through hole as a
+    hazard, so the pather routes AROUND it forever), so it strands itself up top. UP: a
+    scout in a room whose only way out is an up-staircase (a STEP object, so
+    find_use_object ignores it) would otherwise never leave. Here we deliberately hunt the
+    matching-direction object — hole/trapdoor/down-stairs for down, up-stairs for up — and
+    step onto it. A relocation is recorded as a source->destination link the colony can
+    route directly next time.
 
-    Two shapes are handled: the hole is NEARBY (walk to an adjacent launch tile and
-    step onto it), or we're STANDING ON it (find_descent skips distance-0). The latter
-    matters because a ladder often lands you right on top of the down-hole, and being
-    *placed* on a hole doesn't drop you — only *stepping* onto it does — so we step off
-    to a neighbour and back on. Returns True if we attempted a descent.
+    Two shapes are handled: the object is NEARBY (walk to an adjacent launch tile and step
+    onto it), or we're STANDING ON it (find_descent skips distance-0). The latter matters
+    because a ladder often lands you right on top of the down-hole, and being *placed* on
+    a floor-change doesn't trigger it — only *stepping* onto it does — so we step off to a
+    neighbour and back on. Returns True if we attempted a floor-change.
     """
     from .nav import find_descent, is_walkable
 
@@ -1517,50 +1842,60 @@ async def _try_descend(session: GameSession, item_flags: ItemFlags,
     pos = session.state.position
     if pos is None:
         return False
+    now = time.monotonic()
+    verb = "descending" if direction == "down" else "ascending"
 
+    skip = _live_tried(tried, now)
     found = find_descent(session.state, item_flags, colony.traversal,
-                         skip=tried, max_dist=max_dist)
+                         skip=skip, max_dist=max_dist, direction=direction)
     if found is not None:
         source, item_id, category, launch, direction = found
-        tried.add(source)  # attempted — don't retry endlessly even if it doesn't pan out
+        tried[source] = now + _TRIED_TTL   # attempted — hold off, but retry after the TTL
         if (pos.x, pos.y) != (launch[0], launch[1]):
             await _walk_to(session, item_flags, launch[0], launch[1],
                            max_steps=40, plan_radius=_PLAN_RADIUS)
             pos = session.state.position
             if pos is None or (pos.x, pos.y) != (launch[0], launch[1]):
                 return True  # couldn't reach it; counts as tried and move on
-        session.status = f"descending ({category})"
+        session.status = f"{verb} ({category})"
         landing = await _perform_traversal(session, source, direction, category, item_id)
         if landing is not None and landing.z != pos.z:
             colony.report_link(source, (landing.x, landing.y, landing.z))
             session.log_event("info", "traversal",
-                              f"descended via {category} at {source} -> "
+                              f"{verb} via {category} at {source} -> "
                               f"({landing.x},{landing.y},{landing.z}); recorded shortcut")
         return True
 
-    # Nothing nearby to walk to — but we might be STANDING on the down-hole (which
+    # Nothing nearby to walk to — but we might be STANDING on the floor-change (which
     # find_descent skips at distance 0). Step off to any walkable neighbour, then back
-    # on, so the *step* onto it triggers the fall.
-    here = session.state.tiles.get((pos.x, pos.y, pos.z))
+    # on, so the *step* onto it triggers the move. BUT respect the cooldown: if THIS tile
+    # is a floor-change we've recently tried, don't re-trigger it — that's exactly the
+    # dead-end bounce (come up a hole, land on it, immediately fall back down). Let the
+    # caller move on to the room's other exits.
+    here_tile = (pos.x, pos.y, pos.z)
+    if here_tile in skip:
+        return False
+    here = session.state.tiles.get(here_tile)
     hit = colony.traversal.classify(tile_ids(here)) if here else None
     if hit is not None:
         kind = colony.traversal.kind(hit[0])
-        if kind is not None and kind.action == "step" and kind.direction == "down":
+        if kind is not None and kind.action == "step" and kind.direction == direction:
+            tried[here_tile] = now + _TRIED_TTL   # record so we don't immediately re-do it
             for name, (dx, dy) in DIRECTION_DELTAS.items():
                 if not is_walkable(session.state, item_flags, pos.x + dx, pos.y + dy, pos.z):
                     continue
-                session.status = "descending (step off/on)"
-                if not await _raw_step(session, name):        # off the hole
+                session.status = f"{verb} (step off/on)"
+                if not await _raw_step(session, name):        # off the tile
                     return True
                 reverse = {"north": "south", "south": "north",
                            "east": "west", "west": "east"}[name]
-                await _raw_step(session, reverse)             # back onto it -> fall
+                await _raw_step(session, reverse)             # back onto it -> triggers
                 landing = session.state.position
                 if landing is not None and landing.z != pos.z:
                     colony.report_link((pos.x, pos.y, pos.z),
                                        (landing.x, landing.y, landing.z))
                     session.log_event("info", "traversal",
-                                      f"descended off/on a hole at {(pos.x, pos.y, pos.z)} -> "
+                                      f"{verb} off/on at {(pos.x, pos.y, pos.z)} -> "
                                       f"({landing.x},{landing.y},{landing.z})")
                 return True
     return False
@@ -1603,9 +1938,20 @@ async def travel(session: GameSession, item_flags: ItemFlags,
             log.info("travel: arrived at %s", pos)
             return True
 
-        route = find_route(colony.get_walkable(), colony.get_links(), here, goal,
-                           reach=reach, avoid=colony.get_hazards(),
-                           costs=colony.get_walk_costs())
+        # "A teleport is a hazard to a wanderer but a highway to a traveller" — and this
+        # is the router that's supposed to drive the highway. But `report_link` files every
+        # link SOURCE into the hazard set, and `find_route` rejects an avoided tile BEFORE
+        # it consults the links table, so handing it the raw hazards made it unable to
+        # traverse ANY shortcut: every goal reachable only via a ladder/hole/teleport came
+        # back "no route". Meanwhile `reachable_frontier` floods across links freely, so it
+        # kept proposing cross-floor frontiers this router structurally could not reach —
+        # the bot chased the same unreachable tile forever. Subtract the links we mean to
+        # use, so the two agree on what "reachable" means.
+        links = colony.get_links()
+        route = find_route(colony.get_walkable(), links, here, goal,
+                           reach=reach, avoid=colony.get_hazards() - set(links),
+                           costs=colony.get_walk_costs(),
+                           step_unconfirmed=colony.get_step_unconfirmed())
         if route is None:
             # Nothing in the shared map connects us — normal when the goal is somewhere
             # nobody has been, or when we're standing in a not-yet-connected pocket.
@@ -1720,6 +2066,41 @@ async def travel_session(host: str, login_port: int, account: str, password: str
     await _run_in_world(session, action)
 
 
+def _scan_exits(session: GameSession, item_flags: ItemFlags, radius: int = 25) -> list:
+    """Diagnostic: every recognised exit object the bot can see nearby, and WHY each is or
+    isn't usable. Turns 'the scout won't try the door' into a concrete, readable list —
+    was the door tile even in our map? does it have a walkable tile to use it from? is it
+    on the tried cooldown? Returns a list of dicts, nearest first.
+    """
+    from .nav import is_walkable
+    st = session.state
+    pos = st.position
+    if pos is None or session.colony is None:
+        return []
+    reg = session.colony.traversal
+    px, py, z = pos.x, pos.y, pos.z
+    out = []
+    for (x, y, tz), items in list(st.tiles.items()):
+        if tz != z:
+            continue
+        d = abs(x - px) + abs(y - py)
+        if d == 0 or d > radius:
+            continue
+        hit = reg.classify(tile_ids(items))
+        if hit is None:
+            continue
+        category, item_id = hit
+        launch = None
+        for name, (dx, dy) in DIRECTION_DELTAS.items():
+            if is_walkable(st, item_flags, x + dx, y + dy, z):
+                launch = (x + dx, y + dy)
+                break
+        out.append({"cat": category, "id": item_id, "pos": (x, y, z), "dist": d,
+                    "launch": launch})
+    out.sort(key=lambda r: r["dist"])
+    return out
+
+
 def _pick_descent(session: GameSession, recent: dict, cooldown: float = 20.0):
     """Choose a discovered shortcut on our floor to drop to a new area.
 
@@ -1782,17 +2163,27 @@ async def scout(session: GameSession, item_flags: ItemFlags,
     down to luck. Bound the scout to a region and it fills the region in.
     """
     import random
-    from .nav import find_frontier
 
     loop = asyncio.get_event_loop()
     end = loop.time() + duration if duration else float("inf")
     recent_descents: dict = {}
-    tried_objects: set = set()          # use-objects we've already attempted this run
-    tried_descents: set = set()         # down-holes we've already attempted this run
-    stale_frontiers: set = set()        # frontiers we can't actually approach (see below)
+    tried_objects: dict = {}            # exit object tile -> when we'll retry it (TTL)
+    tried_descents: dict = {}           # floor-change tile -> when we'll retry it (TTL)
+    stale_frontiers: set = set()        # (x,y,z) frontiers we've given up reaching
+    frontier_tries: dict = {}           # frontier -> failed travel attempts; retire after
+                                        # a few so a leak into a sealed room can't lure us
+                                        # forever. Cleared with stale_frontiers.
     last_floor = None
     scout_stuck = 0                     # consecutive rounds without moving
     boxed_logged = False                # so we log a boxed-in scout only once
+    last_exit_report = 0.0              # throttle the "what exits can I see" diagnostic
+    # Loop-breaker: the honest measure of "am I actually doing my job" is whether I'm
+    # REVEALING NEW MAP. If `seen` hasn't grown in a while, I'm looping in explored
+    # territory — so give up, go home to the temple, and start fresh from a known-
+    # connected spot rather than thrash where I am. This is a calm circuit-breaker, not a
+    # fix for the underlying loop; it just keeps a stuck bot from being miserable to watch.
+    last_seen_count = len(session.state.seen)
+    last_growth = loop.time()
 
     while loop.time() < end and not session.closed.is_set() and not session.stop_event.is_set():
         if _check_watchdog(session):   # dead connection -> abort
@@ -1802,15 +2193,69 @@ async def scout(session: GameSession, item_flags: ItemFlags,
         if pos is None:
             break
 
+        # -- loop-breaker: no new map for a while => go home and reset ---------------
+        now = loop.time()
+        if len(session.state.seen) > last_seen_count:
+            last_seen_count = len(session.state.seen)
+            last_growth = now
+            # Real progress: we revealed new map, so any frontier we'd retired as
+            # "unreachable" deserves reconsidering from here. This is the RIGHT trigger to
+            # forget the frontier blacklist — tying it to actual map growth, NOT to every
+            # step (which is what let a scout circle a room forever: it kept moving toward
+            # a frontier it never resolved, and each twitch wiped the retirement that would
+            # otherwise have exhausted the frontier and dropped it into the exit hunt).
+            stale_frontiers.clear(); frontier_tries.clear()
+        elif center is None and now - last_growth > _LOOP_BREAK_SECONDS:
+            home = getattr(session.colony, "stash", None) if session.colony else None
+            session.log_event("warning", "loop-break",
+                              f"no new map for {_LOOP_BREAK_SECONDS:.0f}s at "
+                              f"({pos.x},{pos.y},{pos.z}); returning to temple, fresh start")
+            # Wipe the local stuck-state so we re-evaluate everything from scratch. The
+            # SHARED map is untouched — that's the point: we head home, then pick a fresh
+            # reachable frontier from what the swarm now knows.
+            #
+            # `stale_frontiers` deliberately SURVIVES. It isn't stuck-state, it's earned
+            # knowledge: each entry cost us _FRONTIER_MAX_TRIES real attempts to prove
+            # unreachable. Clearing it here (as this did originally) re-armed the very trap
+            # that caused the loop — the bot retired a frontier after 3 tries, ran 60s
+            # without new map, loop-broke, forgot the retirement, and walked straight back.
+            # That's the repeat we watched in the decision trace. Genuine region changes are
+            # already handled by the floor-change clear below.
+            frontier_tries.clear()
+            session.state.blocked_tiles.clear(); session.state.blocked_expiry.clear()
+            scout_stuck = 0
+            last_growth = now            # don't immediately re-trigger
+            session.expect_movement = True
+            if home is not None:
+                session.decide("loop-break", f"no new map {_LOOP_BREAK_SECONDS:.0f}s -> temple")
+                if not await navigate_to(session, item_flags, home[0], home[1], home[2],
+                                         deadline=now + _SCOUT_NAV_BUDGET, only=None):
+                    # Can't even route home (we're in a disconnected pocket). Idling beats
+                    # thrashing — sit quietly until the watchdog/relog recovers us.
+                    session.decide("loop-break", "home unreachable, idling")
+                    session.expect_movement = False
+                    await asyncio.sleep(5.0)
+            else:
+                session.decide("loop-break", "no home set, idling")
+                session.expect_movement = False
+                await asyncio.sleep(5.0)
+            continue
+
         # Forget our blacklists whenever we change floor/region: frontiers that were
         # unreachable here may be reachable from the new area, and vice versa.
         if pos.z != last_floor:
-            stale_frontiers.clear()
+            stale_frontiers.clear(); frontier_tries.clear()
             last_floor = pos.z
             scout_stuck = 0
             boxed_logged = False
 
         round_start = (pos.x, pos.y, pos.z)
+
+        # Self-defence, every round: if something is next to us, hit it. Non-blocking —
+        # it just keeps the server-side attack target current, so we go on scouting while
+        # the melee happens. (`_fight_free` below is a different thing: an escape tool for
+        # when monsters have us fully boxed in.)
+        await _engage_adjacent(session)
 
         # On-sight object use: if a ladder/hole/grate/door is right next to us, try
         # it once (proactive detection). This is the thing that actually exercises
@@ -1826,7 +2271,7 @@ async def scout(session: GameSession, item_flags: ItemFlags,
             else:
                 scout_stuck = 0
                 boxed_logged = False
-                stale_frontiers.clear()
+                stale_frontiers.clear(); frontier_tries.clear()
             continue
 
         # Boxed in — we've gone several rounds without moving. Back off so the
@@ -1846,8 +2291,10 @@ async def scout(session: GameSession, item_flags: ItemFlags,
                                   f"tiles here, {nlinks} known exits on this floor — "
                                   f"trying to break out")
                 boxed_logged = True
-            session.status = "breaking out"
-            stale_frontiers.clear()
+            session.decide("breaking out",
+                           f"{len(_adjacent_monsters(session))} monsters, "
+                           f"{len(session.state.blocked_tiles)} blocks")
+            stale_frontiers.clear(); frontier_tries.clear()
             # If MONSTERS are what's boxing us in, no amount of re-stepping or re-routing
             # helps — the walkable tiles are occupied by living creatures. Melee our way
             # out first (only when stuck, so fleeing was never an option). If it opens a
@@ -1871,23 +2318,41 @@ async def scout(session: GameSession, item_flags: ItemFlags,
             # through to the planner-based escape chain (a link out may have appeared).
             await asyncio.sleep(3.0)
 
-        frontier = find_frontier(session.state, item_flags, skip=stale_frontiers,
-                                 center=center, radius=radius)
+        # Features A + B + C — SHARED, REACHABILITY-AWARE frontier. Ask the colony for the
+        # nearest frontier we can actually reach by walking + known ladders/stairs (it
+        # floods the shared map from us over links). This is the whole fix for the wasted
+        # balcony/island trips:
+        #   A — a tile another bot already revealed isn't a frontier for anyone;
+        #   B — a finished region has no frontiers, and a walled-off/disconnected room is
+        #       never reached by the flood, so neither is ever targeted;
+        #   C — a frontier down a ladder comes back as a target `travel` routes to DOWN the
+        #       ladder, instead of the old doomed same-floor walk to a disconnected tile.
+        # The selector must exclude exactly what the router will (see reachable_frontier's
+        # `avoid`), or it hands us frontiers `travel` can't reach and we loop on them. Note
+        # blocked_tiles already absorbs the hazard set (see _report_to_colony), and BOTH
+        # are minus the links — those are the shortcuts we intend to ride, not walls.
+        frontier = None
+        if session.colony is not None:
+            nav_avoid = ((session.colony.get_hazards() | set(session.state.blocked_tiles))
+                         - set(session.colony.get_links()))
+            frontier = session.colony.reachable_frontier(
+                pos.x, pos.y, pos.z, skip=stale_frontiers,
+                center=center, radius=radius, avoid=nav_avoid)
         if frontier is not None:
-            session.status = "surveying" if center else "scouting"
-            if session.recorder is not None:
-                session.recorder.decision("chose_frontier", target=list(frontier))
-            await _walk_to(session, item_flags, frontier[0], frontier[1],
-                           max_steps=40, plan_radius=_PLAN_RADIUS)
-            after = session.state.position
-            # If a whole walk didn't move us at all, this frontier is reachable in a
-            # straight line but not within the planner's local radius (e.g. it's just
-            # across a bay — 7 tiles away but a 40+ tile detour). Blacklist it so we
-            # pick a different frontier instead of hammering this one (the peninsula
-            # stuck-loop). The blacklist is transient: it's cleared the moment we move
-            # or back off, so a genuinely-reachable frontier is always retried.
-            if after is not None and (after.x, after.y) == (pos.x, pos.y):
-                stale_frontiers.add(frontier)
+            session.decide("surveying" if center else "scouting",
+                           f"-> frontier {frontier}")
+            arrived = await navigate_to(session, item_flags, frontier[0], frontier[1],
+                                        frontier[2], deadline=loop.time() + _SCOUT_NAV_BUDGET,
+                                        only=None)
+            if arrived:
+                frontier_tries.pop(frontier, None)   # reached it; its unseen edge reveals
+            else:
+                # Couldn't get there — a leak into a sealed room, or a link we can't
+                # execute. Retire it durably after a few tries so it can't lure us back
+                # (stale_frontiers persists until we change floor).
+                frontier_tries[frontier] = frontier_tries.get(frontier, 0) + 1
+                if frontier_tries[frontier] >= _FRONTIER_MAX_TRIES:
+                    stale_frontiers.add(frontier)
         elif center is not None:
             # SURVEY MODE and no frontier in the box. Two very different reasons:
             if abs(pos.x - center[0]) + abs(pos.y - center[1]) > radius:
@@ -1895,71 +2360,113 @@ async def scout(session: GameSession, item_flags: ItemFlags,
                 # which can be hundreds of tiles away. find_frontier is bounded to the
                 # box, so from out here it always says None and we'd idle forever
                 # "surveying" an area we never visit. Go there first.
-                session.status = "travelling to survey area"
+                session.decide("to survey area", f"outside box -> {center}")
                 session.expect_movement = True
                 log.info("scout: outside survey area; travelling to %s", center)
-                await travel(session, item_flags, center[0], center[1], pos.z)
+                await navigate_to(session, item_flags, center[0], center[1], pos.z,
+                                  deadline=loop.time() + _SCOUT_NAV_BUDGET, only=None)
             else:
                 # Genuinely done. Descending or hunting an exit is what we must NOT do —
                 # that's how a scout leaves town and stops contributing the connected
                 # coverage the router needs. Idle; the caller ends us by `duration`.
-                session.status = "survey complete"
+                session.decide("survey complete", "box fully mapped, idling")
                 session.expect_movement = False   # stillness is intended: don't relog
                 session._report_to_colony()
                 await asyncio.sleep(2.0)
         else:
-            # Reachable land here is mapped (or walled off) — find a way OFF this
-            # floor. PROACTIVELY prefer a NEARBY untried use-object (ladder / hole /
-            # grate / door): using it either drops us somewhere new (recording the
-            # shortcut) or OPENS a door the pather was avoiding as a wall — and it's
-            # the only thing that exercises the USE executor at all, since a known
-            # step-link would otherwise always win first. Then fall back to a known
-            # step-descent, then to random seeking. Runs even when boxed in (that's
-            # how a stuck scout travels out); the backoff above paces the searches.
-            link = _pick_descent(session, recent_descents)
+            # Reachable land here is mapped (or walled off) — find a way OFF this floor.
+            # Order matters, and it MUST prefer LOCAL exits over map-wide ones:
+            #   1. a nearby use-object (door/ladder/grate) — open/use it right here;
+            #   2. a nearby down-hole, then a nearby up-staircase — step onto it;
+            #   3. ONLY if nothing local exists, travel to a learned link elsewhere.
+            # The old order tried the learned link (2) BEFORE the local hole/stairs, and
+            # that trapped scouts: once the colony has learned ANY link on this floor,
+            # `_pick_descent` always returns one, so a scout walled in a small room spent
+            # forever trying to `travel` to a far link it couldn't reach — and never tried
+            # the hole or staircase sitting right there in the room (they were unreachable
+            # `elif` branches). Local first means the room's own exit is always attempted.
+            # Runs even when boxed in (that's how a stuck scout travels out); the backoff
+            # above paces the searches.
+            #
+            # Diagnostic (throttled): whenever we're hunting an exit, log every recognised
+            # exit object we can see and why it's usable or not — the fast way to answer
+            # "why won't it try the door" (not in our map? no walkable tile to use it
+            # from?). Cheap and bounded to _USE_OBJECT_RADIUS.
+            if now - last_exit_report > 5.0:
+                last_exit_report = now
+                seen_exits = _scan_exits(session, item_flags, radius=_USE_OBJECT_RADIUS)
+                if seen_exits:
+                    summary = "; ".join(
+                        f"{e['cat']}#{e['id']}@{e['pos'][0]},{e['pos'][1]} d{e['dist']} "
+                        f"launch={'yes' if e['launch'] else 'NONE'}"
+                        for e in seen_exits[:8])
+                    session.log_event("info", "exits",
+                                      f"can see {len(seen_exits)} exit(s): {summary}")
+                else:
+                    session.log_event("info", "exits", "no recognised exit in view")
+
             if await _try_use_object(session, item_flags, tried_objects,
                                      max_dist=_USE_OBJECT_RADIUS):
                 pass  # attempted a nearby ladder/hole/grate/door (status set inside)
-            elif link is not None:
-                src, dst = link
-                recent_descents[src] = loop.time()
-                session.status = "descending"
-                log.info("scout: floor mapped; taking shortcut %s -> %s to a new area", src, dst)
-                if session.recorder is not None:
-                    session.recorder.decision("take_shortcut", src=list(src), dst=list(dst))
-                await travel(session, item_flags, dst[0], dst[1], dst[2])
             elif await _try_descend(session, item_flags, tried_descents,
                                     max_dist=_DESCENT_RADIUS):
-                # No learned link off this floor, but we RECOGNISE a down-hole /
-                # trapdoor / down-stairs (seeded from the catalog) — step onto it to
-                # get down. This is what lets a scout that climbed UP a ladder find the
-                # way back DOWN instead of stranding itself up top.
-                pass  # attempted a recognised descent (status set inside)
+                # A nearby way DOWN we recognise: a hole / trapdoor / down-stairs we step
+                # onto, or a sewer grate we use. Tried before any map-wide link so a scout
+                # actually uses the exit in its own room instead of trekking off to a
+                # distant one it may not even be able to reach.
+                pass  # attempted a local descent (status set inside)
+            elif await _try_descend(session, item_flags, tried_descents,
+                                    max_dist=_DESCENT_RADIUS, direction="up"):
+                # A nearby UP-staircase. Down is preferred (that's how a scout ranges into
+                # new territory), but a room whose only exit is up-stairs would otherwise
+                # trap it. Up-ladders are USE objects already covered above; this catches
+                # the STEP up-stairs find_use_object ignores.
+                pass  # attempted a local ascent (status set inside)
+            elif (link := _pick_descent(session, recent_descents)) is not None:
+                # No LOCAL exit worked — fall back to a learned link elsewhere on the
+                # floor and travel to it. This is the efficient dispersal path when the
+                # local area is genuinely mapped out; it's just no longer allowed to
+                # pre-empt the local exits above.
+                src, dst = link
+                recent_descents[src] = loop.time()
+                session.decide("descending", f"{src} -> {dst}")
+                log.info("scout: floor mapped; taking shortcut %s -> %s to a new area", src, dst)
+                await navigate_to(session, item_flags, dst[0], dst[1], dst[2],
+                                  deadline=loop.time() + _SCOUT_NAV_BUDGET, only=None)
             else:
                 # No known way off this floor yet — hop somewhere far to bump into
                 # (and thus discover) an undiscovered staircase/teleport.
-                session.status = "seeking exit"
+                session.decide("seeking exit", "no known way off floor")
                 await _walk_to(session, item_flags,
                                pos.x + random.randint(-30, 30),
                                pos.y + random.randint(-30, 30),
                                max_steps=40, plan_radius=_PLAN_RADIUS)
 
-        # Track whether this whole round actually moved us, to detect a boxed-in
-        # scout. Any movement clears the flag AND the frontier blacklist — we've
-        # relocated, so old unreachability judgements no longer hold.
+        # Track whether this whole round actually moved us, to detect a boxed-in scout.
+        # NOTE: we deliberately do NOT clear the frontier blacklist here. Mere movement
+        # isn't progress — a scout circling a room moves every round yet resolves nothing,
+        # and wiping the retirement on each step is exactly what kept it from ever
+        # exhausting an unreachable frontier and reaching the exit hunt. The blacklist is
+        # cleared on real map growth (see the loop-breaker above) and on floor change.
         after = session.state.position
         if after is not None and (after.x, after.y, after.z) == round_start:
             scout_stuck += 1
         else:
             scout_stuck = 0
             boxed_logged = False
-            stale_frontiers.clear()
-            # A floor change means a fresh set of use-objects/holes to consider — clear
-            # the "already tried" memory so we'll happily use this floor's ladders and
-            # holes (including the way back DOWN we just arrived above).
+            # A floor change means the old floor's frontier judgements no longer apply —
+            # re-evaluate its frontiers next time we're here.
+            #
+            # We do NOT clear tried_objects/tried_descents on floor change any more — the
+            # 45s TTL governs re-tries instead. Clearing them here caused a dead-end
+            # BOUNCE: a scout would take a down-hole into a small room, find its only way
+            # out is back up, return — and the floor change wiped the "tried" memory, so it
+            # immediately re-took the SAME hole and never advanced to the room's OTHER
+            # exits (the up-staircase, the door). Keeping the cooldown across the round
+            # trip lets it try the hole, then the stairs, then the door in turn, while the
+            # TTL still lets it revisit the hole later in case something changed.
             if after is not None and after.z != round_start[2]:
-                tried_objects.clear()
-                tried_descents.clear()
+                stale_frontiers.clear(); frontier_tries.clear()
         await asyncio.sleep(0.2)
     session.status = "idle"
     session._report_to_colony()
@@ -2008,6 +2515,122 @@ async def scout_session(host: str, login_port: int, account: str, password: str,
     finally:
         if session.recorder is not None:
             session.recorder.close()
+
+
+async def navigate_to(session: GameSession, item_flags: ItemFlags,
+                      x: int, y: int, z: int, deadline: float | None = None,
+                      only: set[str] | None = _DOOR_CATEGORIES) -> bool:
+    """Directed navigation to an EXACT tile — the ONE place "get me to a known point"
+    lives, used by the nav tests AND (see `scout`) by any bot heading to a destination
+    it already picked (a frontier, a learned shortcut, home). Scout's OWN job stays
+    picking where to go; this owns how to get there, so a fix here (opening a stuck
+    door, recovering a floor mismatch) benefits every caller instead of needing a
+    second, independently-drifting copy.
+
+    Routes over the colony's shared map (`travel`) with a local feel-your-way fallback,
+    retrying until we're standing on (x, y, z) or `deadline` (an event-loop time) passes.
+    Returns True iff we arrived exactly.
+
+    `only` restricts which USE-objects a stalled walk may clear — the default
+    (`_DOOR_CATEGORIES`) is right for the nav tests and anything that must NOT be
+    knocked off its route by ducking into a ladder/grate. Pass `only=None` for a caller
+    (scout) that's happy to be relocated by ANY exit it stumbles on while trying to
+    make progress — that's exploration, not a wrong turn.
+
+    BLOCKED/DETOURED BY A CREATURE. A door or a wrong floor aren't the only things that
+    can stand between here and there — a monster (or another bot/player) parked in a
+    single-tile corridor does too, and unlike terrain, an occupied tile is never durably
+    blocked (see `_walk_to`'s "rejected" handling), so re-planning around it can spin
+    forever if it's the ONLY route. This loop tracks net progress round to round; once
+    we've gone genuinely nowhere for `_NAV_FIGHT_THRESHOLD` rounds, it escalates the same
+    way `scout` always has for its own travel (see `_fight_free`/`_escape_step`) — melee
+    through if a monster is actually adjacent, else try a raw step past what might just be
+    a stale block from a bot/player that has since moved on. Generalized here so it isn't
+    scout-only: any caller heading to a known destination gets it.
+    """
+    loop = asyncio.get_event_loop()
+    door_tried: dict = {}    # door tile -> retry time, so we don't hammer one that won't open
+    floor_tried: dict = {}   # floor-change tile -> retry time (same idea, for stairs/holes)
+    nav_stuck = 0            # consecutive rounds with no net movement — see _NAV_FIGHT_THRESHOLD
+    while True:
+        pos = session.state.position
+        if pos is not None and (pos.x, pos.y, pos.z) == (x, y, z):
+            return True
+        if session.closed.is_set() or session.stop_event.is_set():
+            return False
+        if deadline is not None and loop.time() >= deadline:
+            return False
+        round_start = (pos.x, pos.y, pos.z) if pos is not None else None
+        before = round_start
+
+        # Blocked or badly detoured for a while — check whether a MONSTER is the reason
+        # before doing anything else this round, mirroring scout's own priority order
+        # (fight, THEN the normal navigation chain). `_fight_free` itself is a no-op
+        # (returns False immediately) if nothing is actually adjacent, so this is safe to
+        # call speculatively. Cap the bout by whatever's left of our own deadline, if any,
+        # so a fight can't run a time-boxed caller (a nav test) past what it promised.
+        if nav_stuck >= _NAV_FIGHT_THRESHOLD:
+            remaining = (deadline - loop.time()) if deadline is not None else None
+            if await _fight_free(session, item_flags, max_seconds=remaining):
+                nav_stuck = 0
+                continue
+            # Not a monster (or the fight timed out) — maybe it's a STALE block: another
+            # bot/player that was in the way has since moved, but our blocked-tile map
+            # still thinks the tile is a wall. A raw step bypasses that bookkeeping.
+            if await _escape_step(session, item_flags):
+                nav_stuck = 0
+                continue
+
+        # Prefer the shared-map router (it uses learned links and crosses floors when the
+        # colony knows a connecting route).
+        if session.colony is not None and await travel(session, item_flags, x, y, z):
+            nav_stuck = 0
+            continue
+
+        # travel() may have moved us a long way even though it didn't fully arrive — e.g.
+        # it can legitimately climb to the target floor and then get stuck at a closed
+        # door. `pos`/`before` above were captured BEFORE travel() ran, so re-read them now:
+        # deciding the floor-vs-walk branch from the STALE pre-travel position is exactly
+        # the bug the efficiency test caught. With a known map, travel() climbed us onto
+        # the destination floor and stalled at the door; the stale pos.z (still the OLD,
+        # lower floor) said "wrong floor", so we hunted an unrelated staircase instead of
+        # opening the door we were already standing next to — a multi-thousand-cost detour
+        # for what should have been one _try_use_object call.
+        pos = session.state.position
+        if pos is None:
+            await asyncio.sleep(0.1)
+            continue
+        before = (pos.x, pos.y, pos.z)
+
+        if pos.z != z:
+            # Wrong floor — the shared router couldn't get us there, so hunt a floor-change
+            # in the target's direction and take it (z is SMALLER higher up in Tibia). This
+            # is the scout's own floor-change hunt: a hole/down-stair we step onto or a
+            # grate we use for DOWN, an up-staircase for UP.
+            await _try_descend(session, item_flags, floor_tried,
+                               max_dist=_DESCENT_RADIUS,
+                               direction="up" if z < pos.z else "down")
+        else:
+            # Right floor — walk toward the target. If that gets us nowhere, an obstacle
+            # (a closed door, or — for a caller that allows it — any known exit) may block
+            # the only route: clear the nearest one the walker parked us beside.
+            await _walk_to(session, item_flags, x, y,
+                           max_steps=60, plan_radius=_PLAN_RADIUS)
+            after = session.state.position
+            after_t = (after.x, after.y, after.z) if after is not None else None
+            if after_t == before:
+                await _try_use_object(session, item_flags, door_tried,
+                                      max_dist=_USE_OBJECT_RADIUS, only=only)
+
+        # Net progress THIS ROUND, start to finish — the honest signal for the fight/
+        # escape escalation above. A round that changed floor/tile counts as progress
+        # even if we're still short of (x, y, z); only a truly flat round counts against us.
+        final = session.state.position
+        if final is not None and (final.x, final.y, final.z) == round_start:
+            nav_stuck += 1
+        else:
+            nav_stuck = 0
+        await asyncio.sleep(0.1)
 
 
 async def goto_session(host: str, login_port: int, account: str, password: str,

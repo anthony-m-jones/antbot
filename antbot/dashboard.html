@@ -233,6 +233,19 @@
   .detstats{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
   .dstat .k{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--tx-faint)}
   .dstat .v{font:600 13px/1.3 var(--mono)}
+  /* decision trace — the bot's "brain": recent phase+why, newest first */
+  .dtrace{margin-top:10px}
+  .dtrace .k{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--tx-faint);margin-bottom:4px}
+  .dtlist{max-height:200px;overflow-y:auto;font:11px/1.5 var(--mono);border:1px solid var(--line-2);border-radius:6px}
+  .dtrow{display:flex;gap:8px;padding:2px 8px;white-space:nowrap;border-bottom:1px solid rgba(255,255,255,.03)}
+  .dtrow.loop{background:rgba(230,178,62,.12)}
+  .dtrow .dtt{color:var(--tx-faint);width:40px;text-align:right;flex:none}
+  .dtrow .dtp{color:#8ff0e0;flex:none}
+  .dtrow .dtw{color:var(--tx-dim);overflow:hidden;text-overflow:ellipsis}
+  /* Planner chip: which pathfinder is steering. Bordered pill, colour set inline
+     (green=shared/global, amber=local/myopic) so a ✕'d amber bot names its own culprit. */
+  .pchip{display:inline-block;font:9px/1.4 var(--mono);text-transform:uppercase;letter-spacing:.06em;
+         border:1px solid;border-radius:4px;padding:0 4px;margin-left:6px;vertical-align:middle}
   .bar2{height:6px;border-radius:3px;background:var(--raised-2);overflow:hidden;margin-top:3px}
   .bar2 i{display:block;height:100%}
   .detail .full{grid-column:1/3}
@@ -385,6 +398,41 @@
 
   .hidden{display:none !important}
   .kbd{font:10px/1 var(--mono);border:1px solid var(--line-2);border-bottom-width:2px;border-radius:4px;padding:2px 5px;color:var(--tx-dim)}
+
+  /* ---- packet inspector overlay (learning tool) ---- */
+  #pktOverlay{position:fixed;inset:0;z-index:50;background:rgba(6,7,9,.92);display:none;
+    grid-template-rows:auto 1fr;font:12px/1.45 var(--mono)}
+  #pktOverlay.open{display:grid}
+  .pkt-bar{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid var(--line-2)}
+  .pkt-bar b{color:var(--accent)}
+  .pkt-bar .sp{margin-left:auto}
+  .pkt-btn{background:var(--line-1);border:1px solid var(--line-2);color:var(--tx);border-radius:6px;
+    padding:5px 10px;cursor:pointer;font:11px/1 var(--mono)}
+  .pkt-btn.on{background:#12332c;border-color:#35e0c5;color:#8ff0e0}
+  .pkt-body{display:grid;grid-template-columns:280px 1fr;min-height:0}
+  #pktList{overflow-y:auto;border-right:1px solid var(--line-2)}
+  .pkt-row{display:flex;gap:8px;padding:4px 10px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.03);white-space:nowrap}
+  .pkt-row:hover{background:rgba(255,255,255,.04)}
+  .pkt-row.sel{background:#12251f}
+  .pkt-row .dir{width:22px;font-weight:700}
+  .pkt-row .dir.rx{color:#6fb6ff}.pkt-row .dir.tx{color:#e6b23e}
+  .pkt-row .sz{width:44px;color:var(--tx-dim);text-align:right}
+  .pkt-detail{display:grid;grid-template-rows:auto auto 1fr;min-height:0;overflow:hidden}
+  #pktHex{padding:10px 14px;border-bottom:1px solid var(--line-2);line-height:1.6;word-break:break-all;max-height:26vh;overflow-y:auto}
+  #pktHex .hb{padding:0 1px;border-radius:2px}
+  #pktHex .hb.hot{background:#e6b23e;color:#111}
+  #pktIcicle{padding:8px 14px;border-bottom:1px solid var(--line-2);overflow-x:auto}
+  .ice{display:flex;flex-direction:column;min-width:2px;border-left:1px solid rgba(0,0,0,.4)}
+  .ice>.lbl{font-size:9px;padding:1px 3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;color:#0b0c0e}
+  .ice>.kids{display:flex;min-height:0}
+  .ice.hot>.lbl{outline:1px solid #fff}
+  #pktTree{overflow-y:auto;padding:8px 14px}
+  .tnode{cursor:pointer;padding:1px 0}
+  .tnode:hover>.trow{background:rgba(255,255,255,.05)}
+  .trow.hot{background:#e6b23e;color:#111;border-radius:3px}
+  .tnode .off{color:var(--tx-dim);margin-right:8px}
+  .tnode .nm{color:#cfe}.tnode .val{color:#8ff0e0}.tnode .hint{color:var(--tx-dim)}
+  .tkids{margin-left:14px;border-left:1px solid var(--line-1);padding-left:8px}
 </style>
 </head>
 <body class="empty-run">
@@ -484,6 +532,8 @@
           <button class="mtool on" id="btnCreat" title="Show creatures (red=monster, blue=NPC, pale=player)">◈</button>
           <button class="mtool on" id="btnIntent" title="Show what each bot is trying to reach (red ✕ = no route)">⌖</button>
           <button class="mtool" id="btnBlocks" title="DEBUG: show blocked-tile types around the followed bot">▦</button>
+          <button class="mtool" id="btnPackets" title="Packet inspector: raw frames + decoded fields for the followed bot">⧉</button>
+          <button class="mtool" id="btnTele" title="Teleport a character (Testerrino) to a clicked tile — for logging in beside a bot to watch it live">⚑</button>
         </div>
 
         <div class="block-legend" id="blockLegend" style="display:none"></div>
@@ -545,6 +595,12 @@
             <button class="btn primary" id="btnStart"><svg width="12" height="12" viewBox="0 0 14 14"><path d="M3 2 L11.5 7 L3 12 Z" fill="currentColor"/></svg> Start</button>
             <button class="btn danger" id="btnStop" disabled>■ Stop</button>
             <button class="btn" id="btnReset" disabled>⟲ Reset to temple</button>
+            <div class="tele-row" style="display:flex;gap:6px;align-items:center;margin-top:8px;font:11px/1 var(--mono);color:var(--tx-dim)">
+              <span>⚑ teleport</span>
+              <input id="teleName" value="Testerrino" title="character to teleport (must be OFFLINE; log in after)"
+                     style="flex:1;min-width:0;background:var(--raised-2);border:1px solid var(--line-2);border-radius:5px;color:var(--tx);padding:5px 7px;font:11px var(--mono)">
+              <span id="teleHint" style="color:var(--tx-faint)">arm ⚑, click map</span>
+            </div>
           </div>
           <div class="dock-sep"></div>
           <div class="run-status" id="runStatus"><span class="led" style="background:var(--tx-faint)"></span> manager idle</div>
@@ -663,6 +719,24 @@ const canvas=document.getElementById("map");
 const ctx=canvas.getContext("2d");
 const wrap=document.getElementById("canvasWrap");
 let view={scale:1,ox:0,oy:0,userZoom:1,fitScale:1,cxWorld:0,cyWorld:0};
+/* The downsampled whole-floor map from /overview.json — see drawOverview. Fetched on a
+   slow cadence (and on floor change) because it's far bigger than a state poll and barely
+   changes; the detailed window keeps arriving at 400ms as before. */
+let OVERVIEW=null, overviewPending=false, overviewAt=0, overviewFloor=null;
+const OVERVIEW_MS=8000;
+const MIN_ZOOM=0.05, MAX_ZOOM=6;
+
+function refreshOverview(force){
+  const z=STATE.floor;
+  if(z===undefined||z===null)return;
+  const now=Date.now();
+  if(!force&&z===overviewFloor&&now-overviewAt<OVERVIEW_MS)return;
+  if(overviewPending)return;
+  overviewPending=true;
+  fetch(`/overview.json?z=${z}&block=4`).then(r=>r.json()).then(o=>{
+    OVERVIEW=o; overviewFloor=z; overviewAt=Date.now();
+  }).catch(()=>{}).finally(()=>{overviewPending=false;});
+}
 let MODE="normal";
 let showCreaturesLive=true, showHeat=false;   // creatures on by default now they're live
 // Intent overlay defaults ON: it's the diagnostic that tells an idle bot
@@ -695,7 +769,15 @@ function tileBounds(tiles){
 }
 function fitView(){
   const tiles=activeTiles(); if(!tiles.length)return;
-  const b=tileBounds(tiles);
+  let b=tileBounds(tiles);
+  // Prefer the OVERVIEW's bounds when we have them for this floor: `tiles` is only the
+  // ±130 window around the followed bot, so fitting to it was never "fit to explored
+  // area" — it was "fit to the slice we happened to be sent". The overview knows the
+  // floor's true extent.
+  if(MODE==="normal"&&OVERVIEW&&OVERVIEW.z===STATE.floor&&OVERVIEW.bounds){
+    const o=OVERVIEW.bounds;
+    b={minx:o[0],miny:o[1],maxx:o[2],maxy:o[3]};
+  }
   const w=wrap.clientWidth, h=wrap.clientHeight, pad=40;
   const spanX=(b.maxx-b.minx)+1, spanY=(b.maxy-b.miny)+1;
   view.fitScale=Math.min((w-pad*2)/spanX,(h-pad*2)/spanY);
@@ -738,7 +820,33 @@ function drawRefGrid(w,h){
   for(let y=(h/2)%step;y<h;y+=step){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
 }
 
+/* The wide shot: the WHOLE floor, downsampled server-side into blocks (/overview.json).
+   /state.json only ships a ±130-tile window around the followed bot, so zooming out used
+   to reveal blank space — the far tiles were never sent, not culled. This paints those
+   blocks UNDERNEATH the detailed window, so you get true extent when zoomed out and full
+   per-tile detail near the bot, without putting the whole map on the 400ms poll.
+
+   Blocks are faded by density (how many of the block's tiles we actually hold), so a cell
+   we've only clipped the corner of doesn't read as confidently as one we've walked. */
+function drawOverview(){
+  if(!OVERVIEW||OVERVIEW.z!==STATE.floor||!OVERVIEW.blocks)return;
+  const s=view.fitScale*view.userZoom;
+  const bs=OVERVIEW.block*s;
+  if(bs<0.35)return;                     // sub-pixel: not worth the fill cost
+  const maxN=OVERVIEW.block*OVERVIEW.block;
+  ctx.save();
+  for(const b of OVERVIEW.blocks){
+    const p=worldToScreen(b[0],b[1]);
+    if(p[0]<-bs||p[1]<-bs||p[0]>wrap.clientWidth||p[1]>wrap.clientHeight)continue;
+    ctx.globalAlpha=0.25+0.45*Math.min(1,b[3]/maxN);
+    ctx.fillStyle=b[2];
+    ctx.fillRect(p[0],p[1],Math.max(1,bs),Math.max(1,bs));
+  }
+  ctx.restore();
+}
+
 function drawTilesLive(ts,s){
+  drawOverview();                        // wide shot first; detail paints over it
   const tiles=STATE.tiles;
   for(let i=0;i<tiles.length;i++){
     const t=tiles[i]; const p=worldToScreen(t[0],t[1]);
@@ -1078,7 +1186,7 @@ function renderBots(){
       const c=botColor(b.name);
       html+=`<div class="bot ${densityMode==='compact'?'compact':''} ${b.name===STATE.focus?'sel':''}" data-bot="${b.name}">
         <span class="dot" style="background:${c}"></span>
-        <div class="idn"><div class="nm">${b.name}${b.stuck?' <span title="wants to reach '+b.goal.slice(0,2).join(',')+' but has no route there" style="color:var(--red)">⌀</span>':''}</div><div class="st">${b.stuck?'<span style="color:var(--red)">no route to '+b.goal.slice(0,2).join(',')+'</span>':b.status} <span class="lvl">· lv ${b.level}</span></div></div>
+        <div class="idn"><div class="nm">${b.name}${b.stuck?' <span title="wants to reach '+b.goal.slice(0,2).join(',')+' but has no route there" style="color:var(--red)">⌀</span>':''}</div><div class="st">${b.stuck?'<span style="color:var(--red)">no route to '+b.goal.slice(0,2).join(',')+'</span>':b.status}${plannerChip(b)} <span class="lvl">· lv ${b.level}</span></div></div>
         <div class="hpwrap"><div class="hpbar"><i style="width:${b.hp_percent}%;background:${hpColor(b.hp_percent)}"></i></div><span class="hp-n">${b.hp_percent}%</span></div>
       </div>`;
     }
@@ -1097,13 +1205,66 @@ function renderDetail(){
   el.innerHTML=`<div class="detail">
     <div class="dh"><span class="dot" style="background:${c};box-shadow:0 0 10px ${c}"></span><span class="nm">${b.name}</span><span class="ch">${b.character}</span></div>
     <div class="detstats">
-      <div class="dstat full"><div class="k">Status</div><div class="v" style="color:${b.hp_percent<25?'var(--red)':'var(--tx)'}">${b.status}</div></div>
+      <div class="dstat full"><div class="k">Status</div><div class="v" style="color:${b.hp_percent<25?'var(--red)':'var(--tx)'}">${b.stuck?'<span style="color:var(--red)">no route to '+b.goal.slice(0,2).join(',')+'</span>':b.status}${plannerChip(b)}</div></div>
       <div class="dstat"><div class="k">Level</div><div class="v">${b.level}</div></div>
       <div class="dstat"><div class="k">Position</div><div class="v" style="font-size:12px">${b.x}, ${b.y} · z${b.z}</div></div>
       <div class="dstat full"><div class="k">Health &nbsp;<span style="color:${hpColor(b.hp_percent)}">${fmtNum(b.hp)} / ${fmtNum(b.max_hp)}</span></div><div class="bar2"><i style="width:${b.hp_percent}%;background:${hpColor(b.hp_percent)}"></i></div></div>
       <div class="dstat full"><div class="k">Mana &nbsp;<span style="color:#5f8fe0">${fmtNum(b.mana)} / ${fmtNum(b.max_mana)}</span></div><div class="bar2"><i style="width:${Math.round(b.mana/b.max_mana*100)}%;background:#5f8fe0"></i></div></div>
     </div>
+    ${renderTracking(b)}
+    ${renderTrace(b)}
   </div>`;
+}
+
+/* Creature-tracking health. A 0x6D move carries no creature id, so the parser identifies
+   the mover purely by where it stood; a "miss" means it couldn't, and some monster is now
+   frozen at a stale tile in our model. Shown ONLY when non-zero — a healthy bot shouldn't
+   carry a permanent scary number, but drift should never be invisible again. */
+function renderTracking(b){
+  const t=b.tracking;
+  if(!t) return "";
+  const miss=t.move_misses||0, ghosts=t.ghosts||0;
+  if(!miss && !ghosts) return "";
+  const col=miss?"var(--amber,#e6b23e)":"var(--tx-dim)";
+  return `<div class="dtrace"><div class="k">Creature tracking</div>`+
+         `<div style="font:11px/1.6 var(--mono);color:${col}">`+
+         `${miss} move${miss===1?"":"s"} unattributed · ${ghosts} stale record${ghosts===1?"":"s"} cleared`+
+         `</div></div>`;
+}
+
+/* Which pathfinder is steering this bot, as a small coloured chip. "shared" = find_route
+   over the colony map (the global one that knows the whole town); "local" = find_path_toward
+   over the bot's own ~8-tile view (the myopic one that dead-ends past the known edge). Amber
+   for local so a bot that goes ✕ while amber points straight at the culprit; green for shared. */
+function plannerChip(b){
+  const s=b.plan_source;
+  if(!s) return "";
+  const col=s==="shared"?"var(--green,#3fb27f)":"var(--amber,#e6b23e)";
+  const tip=s==="shared"?"routing over the shared colony map (find_route)"
+                        :"feeling its way over its own local view (find_path_toward)";
+  return `<span class="pchip" title="${tip}" style="color:${col};border-color:${col}">${s}</span>`;
+}
+
+/* The decision trace — newest first. We flag a genuine loop by counting REPEATED
+   DECISIONS (same phase AND same target/why), not just repeated phases — a scout marching
+   through fresh frontiers is all "scouting" but every target differs, so it's NOT a loop;
+   a scout re-picking the same frontier over and over IS. Repeats (3+) glow amber. */
+function renderTrace(b){
+  const ds=b.decisions;
+  if(!ds||!ds.length) return "";
+  const key=d=>d[1]+" | "+(d[2]||"");
+  const counts={};
+  for(const d of ds){const k=key(d);counts[k]=(counts[k]||0)+1;}
+  const now=Date.now()/1000;
+  const rows=ds.slice().reverse().map(d=>{
+    const ago=Math.max(0,Math.round(now-d[0]));
+    const loop=counts[key(d)]>=3?" loop":"";
+    return `<div class="dtrow${loop}"><span class="dtt">${ago}s</span>`+
+           `<span class="dtp">${d[1]}</span><span class="dtw">${(d[2]||"").replace(/</g,"&lt;")}</span></div>`;
+  }).join("");
+  const looping=Object.values(counts).some(n=>n>=3);
+  return `<div class="dtrace"><div class="k">Decision trace ${plannerChip(b)} ${looping?'· <span style="color:var(--amber,#e6b23e)">LOOPING</span>':''}</div>`+
+         `<div class="dtlist">${rows}</div></div>`;
 }
 
 function follow(name){
@@ -1272,9 +1433,35 @@ function clearPath(){
   document.getElementById("pathHint").innerHTML="Click the map to drop a <b>start</b> pin.";
 }
 
+/* Teleport tool: park a character (default Testerrino) on a clicked tile so you can log
+   in beside a bot and watch it live. DB-teleport takes effect on LOGIN, so the target
+   must be OFFLINE — you teleport, THEN log in. Works in any map mode (you click the live
+   map next to the bot you want to inspect). */
+let teleArmed=false;
+function setTeleArmed(on){
+  teleArmed=on;
+  const btn=document.getElementById("btnTele");
+  if(btn)btn.classList.toggle("on",on);
+  wrap.style.cursor=on?"crosshair":"";
+  const hint=document.getElementById("teleHint");
+  if(hint){hint.textContent=on?"click a tile…":"arm ⚑, click map";hint.style.color=on?"var(--amber,#e6b23e)":"var(--tx-faint)";}
+}
+
 canvas.addEventListener("click",e=>{
-  if(MODE!=="path")return;
   const r=canvas.getBoundingClientRect();
+  if(teleArmed){
+    const [x,y]=screenToWorld(e.clientX-r.left,e.clientY-r.top);
+    const raw=(document.getElementById("teleName").value||"Testerrino").trim()||"Testerrino";
+    const z=STATE.floor;
+    fetch(`/command?action=teleport&name=${encodeURIComponent(raw)}&x=${x}&y=${y}&z=${z}`,{cache:"no-store"})
+      .then(r=>r.json()).then(j=>{
+        if(j&&j.error)toast("warn","teleport: "+j.error);
+        else toast("ok",`teleported ${raw} to ${x}, ${y} · z${z} — log in to see it`);
+      }).catch(()=>toast("warn","teleport failed"));
+    setTeleArmed(false);
+    return;
+  }
+  if(MODE!=="path")return;
   const w=screenToWorld(e.clientX-r.left,e.clientY-r.top);
   if(!path.start||path.report){clearPath();path.start=w;document.getElementById("pathHint").innerHTML="Now click to drop the <b>end</b> pin.";}
   else if(!path.end){path.end=w;computePath();}
@@ -1393,6 +1580,7 @@ async function pollTick(){
   if(f&&MODE==="normal"&&floorOverride==null){ view.cxWorld+=(f.x-view.cxWorld)*0.25; view.cyWorld+=(f.y-view.cyWorld)*0.25; }
   seedControlsFromPool(); syncRunningUI();
   fetchBlocks();
+  refreshOverview();   // self-throttled: only really fetches on floor change / every 8s
   document.getElementById("teExplored").innerHTML=fmtNum(STATE.explored_total)+"<small> tiles</small>";
   // Bots with a goal but no route to it. Surfaced up here because it's the difference
   // between "quietly working" and "burning the session on an impossible target", and
@@ -1415,7 +1603,7 @@ function refreshBotsLight(){
     const b=STATE.bots.find(x=>x.name===el.dataset.bot);if(!b)return;
     const bar=el.querySelector(".hpbar i");if(bar){bar.style.width=b.hp_percent+"%";bar.style.background=hpColor(b.hp_percent);}
     const n=el.querySelector(".hp-n");if(n)n.textContent=b.hp_percent+"%";
-    const st=el.querySelector(".st");if(st)st.innerHTML=`${b.stuck?'<span style="color:var(--red)">no route to '+b.goal.slice(0,2).join(',')+'</span>':b.status} <span class="lvl">· lv ${b.level}</span>`;
+    const st=el.querySelector(".st");if(st)st.innerHTML=`${b.stuck?'<span style="color:var(--red)">no route to '+b.goal.slice(0,2).join(',')+'</span>':b.status}${plannerChip(b)} <span class="lvl">· lv ${b.level}</span>`;
   });
 }
 
@@ -1468,6 +1656,7 @@ function init(){
   document.getElementById("btnStart").onclick=commandStart;
   document.getElementById("btnStop").onclick=commandStop;
   document.getElementById("btnReset").onclick=commandReset;
+  document.getElementById("btnTele").onclick=()=>setTeleArmed(!teleArmed);
   document.getElementById("btnClearPath").onclick=clearPath;
   bindSteppers();initReplayUI();
   // search + density + scale
@@ -1487,8 +1676,11 @@ function init(){
     if(floorOverride!=null){ floorOverride=null; document.getElementById("hudMode").querySelector("span").textContent=MODE==="normal"?"LIVE":MODE.toUpperCase(); }
     view.userZoom=1; fitView();
   };
-  document.getElementById("btnZin").onclick=()=>view.userZoom=Math.min(6,view.userZoom*1.25);
-  document.getElementById("btnZout").onclick=()=>view.userZoom=Math.max(0.4,view.userZoom/1.25);
+  document.getElementById("btnZin").onclick=()=>view.userZoom=Math.min(MAX_ZOOM,view.userZoom*1.25);
+  // Zoom-out floor was 0.4 because below that you were staring into blank space past the
+  // ±130-tile window. Now that the overview ships the whole floor there is something out
+  // there to see, so this opens up to 0.05 (~8x more range).
+  document.getElementById("btnZout").onclick=()=>view.userZoom=Math.max(MIN_ZOOM,view.userZoom/1.25);
   document.getElementById("btnHeat").onclick=e=>{showHeat=!showHeat;e.currentTarget.classList.toggle("on",showHeat);toast("ok",showHeat?"coverage heatmap (planned) — preview on":"heatmap off");};
   document.getElementById("btnIntent").onclick=e=>{showIntent=!showIntent;e.currentTarget.classList.toggle("on",showIntent);toast("ok",showIntent?"intent overlay on — ring = goal, red ✕ = no route to it":"intent overlay off");};
   document.getElementById("btnBlocks").onclick=e=>{showBlocks=!showBlocks;e.currentTarget.classList.toggle("on",showBlocks);if(!showBlocks){BLOCKS=null;updateBlockLegend();}else{fetchBlocks();}toast("ok",showBlocks?"block inspector on — follow a bot to see its blocked-tile types":"block inspector off");};
@@ -1496,7 +1688,7 @@ function init(){
   // connection state is driven by the live poll (setConnected), not a manual toggle
   document.getElementById("conn").title="";
   // wheel zoom on map
-  wrap.addEventListener("wheel",e=>{e.preventDefault();view.userZoom=Math.max(0.4,Math.min(6,view.userZoom*(e.deltaY<0?1.1:0.9)));},{passive:false});
+  wrap.addEventListener("wheel",e=>{e.preventDefault();view.userZoom=Math.max(MIN_ZOOM,Math.min(MAX_ZOOM,view.userZoom*(e.deltaY<0?1.1:0.9)));},{passive:false});
 
   window.addEventListener("resize",()=>{resizeCanvas();fitView();});
   // The canvas backing store only tracked WINDOW resizes, so anything that resized the
@@ -1525,6 +1717,156 @@ async function changeFloor(d){
 function tickClock(){const d=new Date();document.getElementById("clock").textContent=d.toTimeString().slice(0,8);}
 
 init();
+</script>
+<!-- packet inspector overlay (populated by the PKT module) -->
+<div id="pktOverlay">
+  <div class="pkt-bar">
+    <span>PACKET INSPECTOR — <b id="pktBot">—</b></span>
+    <button class="pkt-btn" id="pktCap">capture: off</button>
+    <span id="pktCount" style="color:var(--tx-dim)"></span>
+    <span class="sp"></span>
+    <button class="pkt-btn" id="pktClose">close ✕</button>
+  </div>
+  <div class="pkt-body">
+    <div id="pktList"></div>
+    <div class="pkt-detail">
+      <div id="pktHex"><span style="color:var(--tx-dim)">select a packet to inspect its bytes</span></div>
+      <div id="pktIcicle"></div>
+      <div id="pktTree"></div>
+    </div>
+  </div>
+</div>
+<script>
+/* Packet inspector — self-contained. Opens an overlay for the followed bot, streams its
+   captured frames (per-bot opt-in on the server), and on click shows the raw hex (A),
+   a decoded field tree (A), and an icicle byte-map (B). Cross-highlights bytes<->fields.
+   Kept in its own module + namespace so it can't disturb the map/replay code. */
+const PKT = {bot:null, sel:null, tree:null, timer:null, curSeq:null};
+
+function pktBotName(){ return STATE.focus || (STATE.bots[0] && STATE.bots[0].name) || null; }
+
+function pktOpen(){
+  const bot = pktBotName();
+  if(!bot){ toast("warn","click a bot first to inspect its packets"); return; }
+  PKT.bot = bot;
+  document.getElementById("pktBot").textContent = bot;
+  document.getElementById("pktOverlay").classList.add("open");
+  pktSetCapture(true);                       // enable capture on open
+  PKT.timer = setInterval(pktPoll, 1000);
+  pktPoll();
+}
+function pktClose(){
+  document.getElementById("pktOverlay").classList.remove("open");
+  clearInterval(PKT.timer); PKT.timer=null;
+  if(PKT.bot) pktSetCapture(false);          // stop capturing when we leave
+}
+async function pktSetCapture(on){
+  if(!PKT.bot) return;
+  try{
+    const r = await (await fetch(`/packets?bot=${encodeURIComponent(PKT.bot)}&on=${on?1:0}`,{cache:"no-store"})).json();
+    const b=document.getElementById("pktCap");
+    b.textContent = "capture: " + (r.capturing?"on":"off");
+    b.classList.toggle("on", !!r.capturing);
+  }catch(e){}
+}
+async function pktPoll(){
+  if(!PKT.bot) return;
+  let d;
+  try{ d = await (await fetch(`/packets.json?bot=${encodeURIComponent(PKT.bot)}`,{cache:"no-store"})).json(); }
+  catch(e){ return; }
+  document.getElementById("pktCount").textContent = (d.frames?d.frames.length:0)+" frames";
+  pktRenderList(d.frames||[]);
+}
+function pktRenderList(frames){
+  const el=document.getElementById("pktList");
+  el.innerHTML = frames.map(f=>
+    `<div class="pkt-row ${f.seq===PKT.curSeq?'sel':''}" data-seq="${f.seq}">`+
+    `<span class="dir ${f.dir}">${f.dir}</span>`+
+    `<span class="op">${f.op}</span>`+
+    `<span class="sz">${f.size}B</span></div>`).join("");
+  el.querySelectorAll(".pkt-row").forEach(r=>r.onclick=()=>pktSelect(+r.dataset.seq));
+}
+async function pktSelect(seq){
+  PKT.curSeq = seq; PKT.sel = null;
+  document.querySelectorAll("#pktList .pkt-row").forEach(r=>r.classList.toggle("sel",+r.dataset.seq===seq));
+  let d;
+  try{ d = await (await fetch(`/packet?bot=${encodeURIComponent(PKT.bot)}&seq=${seq}`,{cache:"no-store"})).json(); }
+  catch(e){ return; }
+  if(d.error){ document.getElementById("pktTree").innerHTML=`<span style="color:var(--red)">${d.error}</span>`; return; }
+  PKT.tree = d;
+  pktRenderHex(d.hex);
+  pktRenderIcicle(d);
+  pktRenderTree(d);
+}
+function pktRenderHex(hex){
+  const bytes = hex.match(/../g) || [];
+  const spans = bytes.map((b,i)=>`<span class="hb" data-off="${i}">${b}</span>${(i%16===15)?'<br>':' '}`);
+  document.getElementById("pktHex").innerHTML = spans.join("");
+  pktHexHighlight();
+}
+function pktHexHighlight(){
+  const sel=PKT.sel;
+  document.querySelectorAll("#pktHex .hb").forEach(s=>{
+    const o=+s.dataset.off;
+    s.classList.toggle("hot", !!sel && o>=sel.off && o<sel.off+sel.size);
+  });
+}
+function pktPick(off,size){ PKT.sel={off,size}; pktHexHighlight(); pktMarkHot(); }
+function pktMarkHot(){
+  const sel=PKT.sel;
+  document.querySelectorAll("#pktTree .trow").forEach(r=>
+    r.classList.toggle("hot", !!sel && +r.dataset.off===sel.off && +r.dataset.size===sel.size));
+  document.querySelectorAll("#pktIcicle .ice").forEach(n=>
+    n.classList.toggle("hot", !!sel && +n.dataset.off===sel.off && +n.dataset.size===sel.size));
+}
+function pktRenderTree(root){
+  const el=document.getElementById("pktTree");
+  el.innerHTML="";
+  (root.children||[]).forEach(c=>el.appendChild(pktTreeNode(c)));
+  if(root.note){ const n=document.createElement("div"); n.style.color="var(--tx-dim)"; n.style.marginTop="6px"; n.textContent="note: "+root.note; el.appendChild(n); }
+}
+function pktTreeNode(node){
+  const wrap=document.createElement("div"); wrap.className="tnode";
+  const row=document.createElement("div"); row.className="trow";
+  row.dataset.off=node.off; row.dataset.size=node.size;
+  const val = (node.value!==null&&node.value!==undefined)?` <span class="val">= ${node.value}</span>`:"";
+  const hint = node.hint?` <span class="hint">(${node.hint})</span>`:"";
+  row.innerHTML=`<span class="off">${node.off}+${node.size}</span><span class="nm">${node.name}</span>${val}${hint}`;
+  row.onclick=(e)=>{ e.stopPropagation(); pktPick(node.off,node.size); };
+  wrap.appendChild(row);
+  if(node.children&&node.children.length){
+    const kids=document.createElement("div"); kids.className="tkids";
+    node.children.forEach(c=>kids.appendChild(pktTreeNode(c)));
+    wrap.appendChild(kids);
+  }
+  return wrap;
+}
+function pktRenderIcicle(root){
+  const el=document.getElementById("pktIcicle"); el.innerHTML="";
+  const total=root.size||1;
+  const row=document.createElement("div"); row.style.display="flex"; row.style.height="100%";
+  (root.children||[]).forEach(c=>row.appendChild(pktIce(c,total)));
+  el.appendChild(row);
+}
+const PKT_HUE=["#6fb6ff","#e6b23e","#35e0c5","#c98bff","#7ee081","#ef7d7d","#f0c96b"];
+function pktIce(node,total){
+  const d=document.createElement("div"); d.className="ice";
+  d.style.flex=(node.size/total)+" 0 0"; d.dataset.off=node.off; d.dataset.size=node.size;
+  const hue=PKT_HUE[(node.off)%PKT_HUE.length];
+  const lbl=document.createElement("div"); lbl.className="lbl"; lbl.style.background=hue;
+  lbl.textContent=`${node.name} · ${node.size}B`; lbl.title=lbl.textContent;
+  lbl.onclick=()=>pktPick(node.off,node.size);
+  d.appendChild(lbl);
+  if(node.children&&node.children.length){
+    const kids=document.createElement("div"); kids.className="kids";
+    node.children.forEach(c=>kids.appendChild(pktIce(c,node.size)));
+    d.appendChild(kids);
+  }
+  return d;
+}
+document.getElementById("btnPackets").onclick=pktOpen;
+document.getElementById("pktClose").onclick=pktClose;
+document.getElementById("pktCap").onclick=()=>pktSetCapture(!document.getElementById("pktCap").classList.contains("on"));
 </script>
 </body>
 </html>

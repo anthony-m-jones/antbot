@@ -225,6 +225,32 @@ class TraversalRegistry:
         log.info("traversal: seeded %d curated use-with objects (shovel/machete)", added)
         return added
 
+    def seed_by_name(self, catalog: dict, needle: str, category: str,
+                     exclude: tuple[str, ...] = ()) -> int:
+        """Seed every id whose catalog NAME contains `needle` (and none of `exclude`).
+
+        The escape hatch for map-baked objects items.xml names but doesn't functionally
+        flag. Sewer grates are the case that forced this: they carry no `type` and no
+        `floorchange` (so `category_from_catalog` returns None), and no Lua script drives
+        them by id — the descend is baked into the .otbm as a teleport tile. All we have
+        statically is the NAME ("sewer grate"), so we seed by name and let the scout
+        discover the destination by trying it (see _perform_traversal's grate handling,
+        which tries USE then STEP and relearns whichever actually moves us).
+
+        Soft-seeded like the rest (`_seeded`), so a bot's own observation always wins, and
+        never overrides an id the catalog already classified (e.g. a grate that DOES carry
+        floorchange stays the STEP object it is). Returns how many ids were added.
+        """
+        added = 0
+        for item_id, info in catalog.items():
+            name = (getattr(info, "name", "") or "").lower()
+            if needle in name and not any(x in name for x in exclude):
+                if item_id not in self._seeded:
+                    self._seeded[item_id] = category
+                    added += 1
+        log.info("traversal: seeded %d '%s' objects by name as %s", added, needle, category)
+        return added
+
     def category_of(self, item_id: int) -> str | None:
         # Learned (observed) beats seeded (catalog); that's the wiggle room.
         return self._by_id.get(item_id) or self._seeded.get(item_id)

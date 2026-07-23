@@ -41,6 +41,33 @@ def _page() -> bytes:
         return b"<h1>dashboard.html not found next to dashboard.py</h1>"
 
 
+def _packet_list(sess) -> dict:
+    """Packet-list rows for the inspector: one summary per buffered frame.
+
+    Cheap: decode each frame only far enough to name its lead opcode. Newest first.
+    """
+    if sess is None:
+        return {"capturing": False, "found": False, "frames": []}
+    from .packet_decode import summarize
+    rows = [{"seq": seq, "t": round(t, 3), "dir": direction, "size": len(payload),
+             "op": summarize(payload, direction)}
+            for seq, t, direction, payload in sess.frames_raw()]
+    rows.reverse()   # newest first
+    return {"capturing": sess.capture_frames, "found": True, "frames": rows}
+
+
+def _packet_decode(sess, seq: int) -> dict:
+    """Full decode (hex + parse tree) of one buffered frame by seq."""
+    if sess is None:
+        return {"error": "bot not found or offline"}
+    got = sess.frame_by_seq(seq)
+    if got is None:
+        return {"error": "frame aged out of the buffer"}
+    from .packet_decode import decode_frame
+    direction, payload = got
+    return decode_frame(payload, direction, item_flags=sess.item_flags)
+
+
 def _route_query(colony: Colony, qs: dict) -> dict:
     """Plan a teleport-aware route from the lead bot to a queried tile."""
     from .nav import find_route
@@ -169,6 +196,17 @@ def _make_handler(colony: Colony, manager=None):
                 # The loot map: what the swarm has SEEN worth fetching, best first.
                 snap["loot"] = colony.loot_snapshot(limit=50)
                 self._send(200, "application/json", json.dumps(snap).encode("utf-8"))
+            elif parsed.path == "/overview.json":
+                # ?z=<floor>&block=<n> : the WHOLE floor, downsampled into blocks, so the
+                # page can draw the colony's true extent when zoomed out. /state.json only
+                # ships a window around the followed bot; this is the wide shot. Polled
+                # rarely (it's much bigger), hence a separate endpoint rather than bloating
+                # every 400ms state poll.
+                q = parse_qs(parsed.query)
+                z = int(q.get("z", [7])[0])
+                block = int(q.get("block", [4])[0])
+                self._send(200, "application/json",
+                           json.dumps(colony.overview(z, block=block)).encode("utf-8"))
             elif parsed.path == "/command":
                 # Control buttons post here: ?action=start|stop|reset (start also takes
                 # ?scouts=&wanderers= so the browser chooses how many of each to launch).
@@ -212,6 +250,33 @@ def _make_handler(colony: Colony, manager=None):
                     r = 60
                 self._send(200, "application/json",
                            json.dumps(colony.debug_tiles(focus, r)).encode("utf-8"))
+            elif parsed.path == "/packets":
+                # Toggle the packet inspector for a bot: ?bot=<name>&on=1|0
+                q = parse_qs(parsed.query)
+                name = q.get("bot", [None])[0]
+                on = q.get("on", ["0"])[0] in ("1", "true", "on")
+                sess = colony.session_for(name) if name else None
+                if sess is not None:
+                    sess.set_capture(on)
+                self._send(200, "application/json",
+                           json.dumps({"bot": name, "capturing": on and sess is not None,
+                                       "found": sess is not None}).encode("utf-8"))
+            elif parsed.path == "/packets.json":
+                # The packet-list rows for a bot: ?bot=<name> -> [{seq,t,dir,size,op}].
+                q = parse_qs(parsed.query)
+                sess = colony.session_for(q.get("bot", [None])[0])
+                self._send(200, "application/json",
+                           json.dumps(_packet_list(sess)).encode("utf-8"))
+            elif parsed.path == "/packet":
+                # One decoded frame: ?bot=<name>&seq=<n> -> the hex + parse tree.
+                q = parse_qs(parsed.query)
+                sess = colony.session_for(q.get("bot", [None])[0])
+                try:
+                    seq = int(q.get("seq", ["0"])[0])
+                except ValueError:
+                    seq = 0
+                self._send(200, "application/json",
+                           json.dumps(_packet_decode(sess, seq)).encode("utf-8"))
             elif parsed.path == "/recordings":
                 # List available session recordings (for the replay picker).
                 self._send(200, "application/json",

@@ -39,6 +39,45 @@ DEFAULT_GROUND_SPEED = 150
 # the A* heuristic admissible once steps cost real time: the cheapest a step can ever be.
 MIN_GROUND_SPEED = 100
 
+# Dedicated logger for the Dijkstra/A* routing decisions themselves (which tiles get
+# considered, what an unconfirmed z-hop is priced at, which one — if any — wins). Kept
+# SEPARATE from the module's normal "antbot" logger so this can be switched on with
+# `logging.getLogger("antbot.route").setLevel(logging.DEBUG)` without drowning in every
+# other subsystem's routine INFO noise. Off (no handler => no output) by default.
+route_log = logging.getLogger("antbot.route")
+
+
+def unconfirmed_step_cost(tile: tuple[int, int, int], goal_x: int, goal_y: int) -> int:
+    """The OPTIMISTIC lower-bound cost of gambling on an unconfirmed STEP-type floor-
+    change (a hole/open-stairs/teleporter we've SEEN but never actually crossed) as a
+    shortcut to (goal_x, goal_y), instead of its ordinary ground cost.
+
+    Why this exists: a STEP-type object relocates you the instant you walk onto it —
+    unlike a ladder (USE-type, needs a deliberate action), there's no way to merely pass
+    near one. So an ordinary same-floor walk that doesn't know any better can stumble
+    through one by accident while just trying to close 2D distance to a goal, taking it
+    somewhere else entirely. Blocking such tiles outright breaks routing in map regions
+    that are genuinely staircase-dense (there may be little ordinary ground between
+    them); pricing them at a flat penalty risks steering AWAY from a route that's
+    actually optimal. Neither is honest, because we don't know what's on the other side.
+
+    This is the answer: charge the CHEAPEST it could possibly cost to actually pay off —
+    one hop up/down (there), the best-case straight-line distance from here to the goal
+    at the fastest ground in the game, and one hop back (here) if a landing conveniently
+    close to the goal existed. That's a genuine ADMISSIBLE lower bound (nothing crosses
+    ground faster, and no route through an unconfirmed crossing can beat "instant
+    teleport to right next to the goal"), so using it as this tile's cost can only ever
+    make the search UNDER-charge the gamble, never bias away from a route that's truly
+    better. A confirmed route that's genuinely cheaper still wins; an unconfirmed
+    crossing only "wins" the search when even its most generous case beats the known
+    alternative — worth investigating, not free, not forbidden.
+
+    Once a crossing is CONFIRMED (actually walked), it becomes a real `_links` entry and
+    this no longer applies — the router prices it at the flat, trusted link-hop cost
+    instead, wherever it truly leads.
+    """
+    return 2 * MIN_GROUND_SPEED + (abs(tile[0] - goal_x) + abs(tile[1] - goal_y)) * MIN_GROUND_SPEED
+
 
 def tile_cost(state: GameState, item_flags: ItemFlags, x: int, y: int, z: int) -> int:
     """What it COSTS to step onto (x, y, z) — Tibia's `groundSpeed` for its ground.
@@ -197,7 +236,9 @@ def find_frontier(state: GameState, item_flags: ItemFlags,
                   max_search: int = 8000,
                   center: tuple[int, int] | None = None,
                   radius: int | None = None,
-                  skip: set[tuple[int, int]] | None = None) -> tuple[int, int] | None:
+                  skip: set[tuple[int, int]] | None = None,
+                  shared_seen: set[tuple[int, int, int]] | None = None
+                  ) -> tuple[int, int] | None:
     """Find the walkable tile that borders UNEXPLORED space and is QUICKEST to reach.
 
     This is what makes exploration purposeful instead of random: it flood-fills the
@@ -259,7 +300,13 @@ def find_frontier(state: GameState, item_flags: ItemFlags,
         # and not one the caller has ruled out as unreachable-in-practice via `skip`.)
         if within((cx, cy)) and (cx, cy) not in skip:
             for _name, dx, dy in _STEPS:
-                if (cx + dx, cy + dy, z) not in state.seen:
+                nb = (cx + dx, cy + dy, z)
+                # A neighbour is a real frontier only if NOBODY has seen it — our own
+                # view OR the shared swarm view. Flooding still uses our OWN reachable
+                # walkable tiles (so the target is reachable), but a tile another bot has
+                # already revealed no longer lures us here. That's feature A: reachability
+                # from us, resolution from the whole colony.
+                if nb not in state.seen and (shared_seen is None or nb not in shared_seen):
                     return (cx, cy)
         # Otherwise keep flooding over walkable neighbours, but never expand past
         # the bound — that's what both keeps wanderers home and caps the work.
@@ -278,7 +325,11 @@ def find_frontier(state: GameState, item_flags: ItemFlags,
 
 def find_path_toward(state: GameState, item_flags: ItemFlags,
                      goal_x: int, goal_y: int,
-                     max_radius: int | None = None) -> list[str] | None:
+                     max_radius: int | None = None,
+                     extra_walkable: set[tuple[int, int, int]] | None = None,
+                     registry=None,
+                     confirmed_links: set[tuple[int, int, int]] | None = None,
+                     ) -> list[str] | None:
     """Path *toward* (goal_x, goal_y), even if it's beyond what we've seen.
 
     This is what makes `goto` work across screens (B3). The goal tile usually
@@ -297,6 +348,28 @@ def find_path_toward(state: GameState, item_flags: ItemFlags,
     new position each step), and turns per-step planning from O(map) into O(radius²)
     — the key to running many bots at once. Leave it None (the default) for `goto`
     /`travel`, which want exact long-distance routing to a specific tile.
+
+    `extra_walkable` lets the flood cross tiles THIS bot hasn't personally seen but
+    the COLONY knows are walkable (pass `colony.walkable_ref()`). Without it the flood
+    is limited to `state.tiles` — a private, one-session view — so a bot that just
+    relogged (empty private map) or whose only route home runs across ground a teammate
+    mapped would find nothing and falsely report "no route", even though a path plainly
+    exists on the shared map. We still test the private map FIRST (first-hand and more
+    current, incl. live creatures), and — crucially — we still honour `blocked_tiles`:
+    a tile the server refused this bot stays refused even if the shared map likes it, so
+    this can't re-open the very trap the bot just backed out of. The flood stays bounded
+    by `max_radius`, so handing in the whole shared set costs only O(1) membership tests.
+
+    `registry` + `confirmed_links` (pass `colony.traversal` / `set(colony.get_links())`)
+    price an UNCONFIRMED STEP-type floor-change (a hole/open-stairs/teleporter we've SEEN
+    but never crossed) at `unconfirmed_step_cost` instead of its ordinary ground cost —
+    see that function for why. Without this, an ordinary walk toward (goal_x, goal_y) can
+    silently step onto one mid-route (it's not blocking, so `is_walkable` allows it) and
+    get relocated somewhere else entirely. Omit both (the default) to skip this pricing
+    entirely — used by callers with no colony to consult.
+
+    LOGGING: emits to the `antbot.route` logger — see `find_route`'s docstring and
+    `nav.route_log`.
 
     Returns the directions toward that best frontier tile, or None if we can't get
     any closer (blocked in, or the goal's direction is walled off in known space).
@@ -326,6 +399,8 @@ def find_path_toward(state: GameState, item_flags: ItemFlags,
     settled: set[tuple[int, int]] = set()
     best = start
     best_dist = abs(start[0] - goal[0]) + abs(start[1] - goal[1])
+    debug = route_log.isEnabledFor(logging.DEBUG)
+    gambled_tiles: set[tuple[int, int]] = set()
 
     while heap:
         cost, current = heapq.heappop(heap)
@@ -333,7 +408,18 @@ def find_path_toward(state: GameState, item_flags: ItemFlags,
             continue
         settled.add(current)
         distance = abs(current[0] - goal[0]) + abs(current[1] - goal[1])
-        if distance < best_dist:
+        # A gambled-onto tile (an unconfirmed z-hop) must NEVER become the walk-toward
+        # TARGET on raw geometric proximity alone. This selection is distance-only —
+        # it doesn't look at cost at all — so an expensive gamble that happens to sit
+        # geometrically nearer the goal (very possible: the real route often has to
+        # detour AWAY from the goal first to get around a wall) would otherwise win by
+        # sheer coordinates despite `unconfirmed_step_cost` correctly pricing it as
+        # expensive. That priced-but-still-selected combination is exactly the bug this
+        # test isolated: the gamble cost only ordered WHEN Dijkstra visited it, never
+        # whether it got PICKED. Crossing one on purpose stays `_try_descend`'s job;
+        # ordinary walking should just report "no closer ordinary tile" and let the
+        # caller's stuck-handling escalate to that deliberate hunt instead.
+        if distance < best_dist and current not in gambled_tiles:
             best_dist, best = distance, current
         if current == goal:
             best = current
@@ -347,24 +433,65 @@ def find_path_toward(state: GameState, item_flags: ItemFlags,
                     abs(neighbor[0] - start[0]) + abs(neighbor[1] - start[1]) > max_radius):
                 continue
             if not is_walkable(state, item_flags, neighbor[0], neighbor[1], z):
-                continue
+                # Fall back to the colony's shared knowledge for tiles we haven't seen
+                # first-hand — but never for a tile the server refused US (blocked_tiles),
+                # or we'd walk straight back into the trap we just escaped.
+                if (extra_walkable is None
+                        or (neighbor[0], neighbor[1], z) not in extra_walkable
+                        or (neighbor[0], neighbor[1], z) in state.blocked_tiles):
+                    continue
             if neighbor != goal and neighbor in occupied:
                 continue
-            nd = cost + tile_cost(state, item_flags, neighbor[0], neighbor[1], z)
-            if nd < best_cost.get(neighbor, 1 << 30):
+            n_tile = (neighbor[0], neighbor[1], z)
+            gamble = False
+            if registry is not None and (confirmed_links is None or n_tile not in confirmed_links):
+                items = state.tiles.get(n_tile)
+                if items:
+                    hit = registry.classify(tile_ids(items))
+                    if hit is not None:
+                        kind = registry.kind(hit[0])
+                        if kind is not None and kind.action == "step":
+                            gamble = True
+            step = (unconfirmed_step_cost(n_tile, goal_x, goal_y) if gamble
+                   else tile_cost(state, item_flags, neighbor[0], neighbor[1], z))
+            nd = cost + step
+            improved = nd < best_cost.get(neighbor, 1 << 30)
+            if debug:
+                route_log.debug(
+                    "  relax %s -%s-> %s  step=%d (%s)  total=%d%s",
+                    (current[0], current[1], z), name, n_tile, step,
+                    "GAMBLE unconfirmed z-hop" if gamble else "ground", nd,
+                    " [IMPROVED]" if improved else " [no improvement, skipped]")
+            if improved:
                 best_cost[neighbor] = nd
                 came_from[neighbor] = (current, name)
                 heapq.heappush(heap, (nd, neighbor))
+                if gamble:
+                    gambled_tiles.add(neighbor)
+                else:
+                    gambled_tiles.discard(neighbor)
 
     if best == start:
+        if debug:
+            route_log.debug("find_path_toward: nothing reachable is closer than %s to %s",
+                            start, goal)
         return None  # nothing reachable is closer than where we already stand
-    return _reconstruct(came_from, best)
+    path = _reconstruct(came_from, best)
+    if best in gambled_tiles:
+        route_log.info("find_path_toward: DECIDED to head for an unconfirmed z-hop at "
+                       "%s (best reachable tile toward %s from %s)", best, goal, start)
+    return path
 
 
 def find_use_object(state: GameState, item_flags: ItemFlags, registry,
                     skip: set[tuple[int, int, int]] | None = None,
-                    max_dist: int | None = None):
+                    max_dist: int | None = None,
+                    only: set[str] | None = None):
     """Find the nearest tile on our floor carrying a known USE-based object.
+
+    `only`, if given, restricts to those categories — e.g. {"door_unlocked"} to hunt only
+    doors. Directed navigation uses this: it wants to OPEN a door blocking the route, but
+    must NOT "use" a ladder/grate (which would relocate it off its path).
 
     "USE-based" = the traversal registry classifies it into a category whose action
     is anything other than a plain STEP (ladders, grates, wells, doors, shovel/rope
@@ -413,6 +540,8 @@ def find_use_object(state: GameState, item_flags: ItemFlags, registry,
         kind = registry.kind(category)
         if kind is None or kind.action == "step":   # step objects aren't "used"
             continue
+        if only is not None and category not in only:
+            continue
         dist = abs(x - px) + abs(y - py)
         if dist == 0 or dist >= best_dist:
             continue
@@ -433,16 +562,18 @@ def find_use_object(state: GameState, item_flags: ItemFlags, registry,
 
 def find_descent(state: GameState, item_flags: ItemFlags, registry,
                  skip: set[tuple[int, int, int]] | None = None,
-                 max_dist: int | None = None):
-    """Find the nearest tile on our floor you can WALK ONTO to go down a floor.
+                 max_dist: int | None = None, direction: str = "down"):
+    """Find the nearest tile on our floor that takes us in `direction` (down/up) a floor.
 
-    This is the mirror of `find_use_object`, but for the STEP-based *descent* objects:
-    open holes / trapdoors / ladder-holes-down / down-stairs — every category whose
-    kind is `action == "step"` and `direction == "down"`. `find_use_object` explicitly
-    skips step objects (they're normally handled as ordinary walk-onto links), which
-    left a real gap: a scout that climbs UP a ladder has no learned link back down and
-    never deliberately seeks the hole to fall through, so it strands itself on the
-    upper floor. This lets it hunt for that hole on purpose.
+    The deliberate floor-change hunt: any object whose direction matches — for `down`, a
+    hole / trapdoor / ladder-hole-down / down-stair you STEP onto, or a grate / well you
+    USE; for `up`, an up-staircase you step onto (USE-ladders up are already found by
+    `find_use_object`). (We used to restrict this to STEP-down, which stranded a scout
+    both above a grate-only sewer AND in a room whose only way out was up-stairs.)
+    `find_use_object` is category-agnostic and grabs the nearest object of ANY kind; this
+    one filters by direction so a floor-change is sought ON PURPOSE — what a scout needs
+    when a room's only exits lead off this floor. The caller traverses it the right way
+    (step vs use) via `_perform_traversal`.
 
     Why we don't just let normal pathfinding walk over the hole: once a bot has fallen
     through a hole we mark that tile blocked (a hazard), so the planner routes AROUND
@@ -481,10 +612,12 @@ def find_descent(state: GameState, item_flags: ItemFlags, registry,
             continue
         category, item_id = hit
         kind = registry.kind(category)
-        # Only STEP-down objects: a hole/trapdoor/down-stair you fall through by
-        # stepping onto it. USE objects (ladders up, grates) belong to
-        # find_use_object; up-stairs and teleporters go the wrong way for a descent.
-        if kind is None or kind.action != "step" or kind.direction != "down":
+        # Anything that takes us in `direction`, however you traverse it: filter by
+        # DIRECTION, not action, so a sewer grate (USE-down) or an up-staircase (STEP-up)
+        # is a first-class floor-change target, deliberately sought (this hunt reaches
+        # _DESCENT_RADIUS=30) rather than merely stumbled on by find_use_object. The caller
+        # dispatches step-vs-use via _perform_traversal. Sideways teleporters are excluded.
+        if kind is None or kind.direction != direction:
             continue
         dist = abs(x - px) + abs(y - py)
         if dist == 0 or dist >= best_dist:
@@ -533,6 +666,7 @@ def find_route(walkable: set[tuple[int, int, int]],
                reach: int = 0,
                avoid: set[tuple[int, int, int]] | None = None,
                costs: dict[tuple[int, int, int], int] | None = None,
+               step_unconfirmed: set[tuple[int, int, int]] | None = None,
                ) -> list[tuple[str, bool, tuple[int, int, int]]] | None:
     """Route across the *whole known world*, using teleports/stairs as shortcuts.
 
@@ -565,6 +699,14 @@ def find_route(walkable: set[tuple[int, int, int]],
     fewest-tiles behaviour. A teleport hop is priced at the cheapest possible step: it is
     effectively instant, and must never look worse than walking.
 
+    `step_unconfirmed` (pass `colony.get_step_unconfirmed()`) prices a tile at
+    `unconfirmed_step_cost` toward `goal` instead of its ordinary `costs` value — see
+    that function. These are STEP-type floor-changes (holes/open-stairs/teleporters)
+    we've SEEN but never actually crossed: they aren't in `links` yet, so without this
+    they're just ordinary walkable ground to this search, and a route can walk straight
+    onto one and get relocated somewhere else. Once a tile like this is actually crossed
+    it moves into `links` and this no longer applies to it.
+
     `start` is always a legal node even if it isn't in `walkable`: we are, self
     evidently, standing on it, whatever the map believes.
 
@@ -572,15 +714,25 @@ def find_route(walkable: set[tuple[int, int, int]],
     if the goal isn't reachable through what we've explored. `is_teleport` marks a
     step where walking `direction` puts you onto a link tile and whisks you to
     `resulting_position` instead of the adjacent tile.
+
+    LOGGING: emits to the `antbot.route` logger at DEBUG (every edge relaxed) and INFO
+    (a step_unconfirmed tile actually winning a spot on the final route) — see
+    `nav.route_log`. Off by default; turn it on to watch the search's own reasoning.
     """
     if within_reach(start, goal, reach):
         return []
 
     avoid = avoid or set()
+    step_unconfirmed = step_unconfirmed or set()
     dist = {start: 0}
     prev: dict[tuple[int, int, int], tuple[tuple[int, int, int], str, bool]] = {}
     heap: list[tuple[int, tuple[int, int, int]]] = [(0, start)]
     target: tuple[int, int, int] | None = None
+    debug = route_log.isEnabledFor(logging.DEBUG)
+    if debug:
+        route_log.debug("find_route: start=%s goal=%s reach=%d, %d unconfirmed z-hop "
+                        "candidate(s) in view: %s",
+                        start, goal, reach, len(step_unconfirmed), sorted(step_unconfirmed))
 
     while heap:
         d, node = heapq.heappop(heap)
@@ -606,17 +758,32 @@ def find_route(walkable: set[tuple[int, int, int]],
             # Both branches must be in the SAME units, or the router mis-prices one of
             # them badly. A teleport is instant, so it costs the cheapest step there is —
             # never more than walking, or we'd trudge straight past a portal.
-            if costs:
-                step = MIN_GROUND_SPEED if teleport else costs.get(landing, DEFAULT_GROUND_SPEED)
+            gamble = not teleport and landing in step_unconfirmed
+            if teleport:
+                step = MIN_GROUND_SPEED
+            elif gamble:
+                step = unconfirmed_step_cost(landing, goal[0], goal[1])
+            elif costs:
+                step = costs.get(landing, DEFAULT_GROUND_SPEED)
             else:
                 step = 1        # unpriced: every step equal, the old fewest-tiles rule
             nd = d + step
-            if nd < dist.get(landing, 1 << 60):
+            improved = nd < dist.get(landing, 1 << 60)
+            if debug:
+                route_log.debug(
+                    "  relax %s -%s-> %s  step=%d (%s)  total=%d%s%s",
+                    node, name, landing, step,
+                    "GAMBLE unconfirmed z-hop" if gamble else ("link" if teleport else "ground"),
+                    nd, " -> confirmed link" if teleport else "",
+                    " [IMPROVED]" if improved else " [no improvement, skipped]")
+            if improved:
                 dist[landing] = nd
                 prev[landing] = (node, name, teleport)
                 heapq.heappush(heap, (nd, landing))
 
     if target is None or target not in prev:
+        if debug:
+            route_log.debug("find_route: NO ROUTE found from %s to %s", start, goal)
         return None
 
     route: list[tuple[str, bool, tuple[int, int, int]]] = []
@@ -626,6 +793,15 @@ def find_route(walkable: set[tuple[int, int, int]],
         route.append((name, teleport, node))
         node = came
     route.reverse()
+
+    gambled_on = [land for _n, _tp, land in route if land in step_unconfirmed]
+    if gambled_on:
+        route_log.info("find_route: DECIDED to cross unconfirmed z-hop(s) %s en route "
+                       "%s -> %s (total cost %d) — betting the optimistic estimate beats "
+                       "the known alternative", gambled_on, start, goal, dist.get(target, -1))
+    elif debug:
+        route_log.debug("find_route: settled on an all-confirmed-ground route %s -> %s "
+                        "(total cost %d)", start, goal, dist.get(target, -1))
     return route
 
 

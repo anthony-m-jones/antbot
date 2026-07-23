@@ -146,6 +146,14 @@ class GameState:
     capacity: int | None = None
     # creature_id -> Creature. Includes ourselves (filter with player_id).
     creatures: dict[int, Creature] = dataclasses.field(default_factory=dict)
+    # Health of our creature tracking, for diagnostics. A 0x6D move names no creature id
+    # (only old/new position), so we can only identify the mover by where it stood — see
+    # _relocate_creature. `creature_move_misses` counts moves we could not attribute to a
+    # creature we know about (that creature is now frozen at a stale tile in our model);
+    # `creature_ghosts_dropped` counts stale records we cleared off a destination tile.
+    # A steadily climbing miss count means our view of monsters is drifting.
+    creature_move_misses: int = 0
+    creature_ghosts_dropped: int = 0
     # (x, y, z) -> list of item ids on that tile, ground first. Sparse: only
     # tiles that actually had contents appear here.
     tiles: dict[tuple[int, int, int], list[int]] = dataclasses.field(default_factory=dict)
@@ -157,6 +165,10 @@ class GameState:
     # as unexplored. The frontier finder uses THIS set instead. Grows with the explored
     # area (like `tiles`); pruning is future work (see BACKLOG).
     seen: set[tuple[int, int, int]] = dataclasses.field(default_factory=set)
+    # Slots added to `seen` since the colony last drained this (a cheap delta). The
+    # colony maintains a SHARED seen set + frontier set (see Colony.contribute_tiles);
+    # handing it only the new slots each report keeps that O(new tiles), not O(whole map).
+    newly_seen: list[tuple[int, int, int]] = dataclasses.field(default_factory=list)
     # Tiles the server refused to let us walk onto even though our map thought
     # they were walkable (an unflagged blocker, a creature, a zone edge, ...).
     # The pathfinder treats these as blocked so it routes around them instead of
@@ -325,8 +337,13 @@ def parse_map_area(reader: MessageReader, item_flags: ItemFlags,
                 tile_pos = Position(base_x + nx + offset, base_y + ny + offset, nz)
                 # Remember EVERY slot the server described — empty ones included. This is
                 # how we later tell open air / cliff void (seen but empty) from genuinely
-                # unexplored space (never described). See GameState.seen.
-                state.seen.add((tile_pos.x, tile_pos.y, tile_pos.z))
+                # unexplored space (never described). See GameState.seen. Newly-seen slots
+                # also go on `newly_seen` so the colony can update its shared frontier set
+                # from just the delta.
+                slot = (tile_pos.x, tile_pos.y, tile_pos.z)
+                if slot not in state.seen:
+                    state.seen.add(slot)
+                    state.newly_seen.append(slot)
                 if skip > 0:
                     skip -= 1  # this slot is a known-empty tile (void / gap / plain empty)
                     continue
@@ -363,6 +380,8 @@ OP_PONG = 0x1D
 OP_TEXT_MESSAGE = 0xB4    # type:u8 + string (for the info/status texts we see)
 OP_CREATURE_SAY = 0xAA    # a creature/NPC/monster spoke — batched near our moves
 OP_PLAYER_STATS = 0xA0    # our own vitals (health/mana/level/...) — see AddPlayerStats
+OP_PLAYER_SKILLS = 0xA1   # our 7 skills, (level u8, percent u8) each — 14 bytes
+OP_CANCEL_TARGET = 0xA3   # server cleared our attack target (u32); fires on every kill
 
 
 @dataclasses.dataclass
@@ -372,7 +391,16 @@ class FrameResult:
     moved: bool = False              # our own position changed this frame
     new_position: Position | None = None
     rejected: bool = False           # the server cancelled our walk (0xB5)
+    # The server cleared our attack target (0xA3) — normally because it died. The client
+    # mirrors this into `session.attack_target` so our idea of who we're hitting can't go
+    # stale and suppress a re-target (see _engage_adjacent).
+    target_cancelled: bool = False
     bailed_opcode: int | None = None  # first opcode we didn't understand (if any)
+    # Byte offset of that opcode inside the frame. A bail ABANDONS the rest of a batched
+    # frame, so knowing where it happened lets us dump the tail and work out the missing
+    # message's real length instead of guessing it (a wrong length desyncs everything
+    # after it, which is strictly worse than bailing).
+    bailed_offset: int | None = None
     # (class, text) status lines the server sent this frame — see OP_TEXT_MESSAGE.
     messages: list[tuple[int, str]] = dataclasses.field(default_factory=list)
 
@@ -444,12 +472,81 @@ def _parse_slice(reader: MessageReader, item_flags: ItemFlags, opcode: int,
         parse_map_area(reader, item_flags, new.x - CENTER_NX, new.y - CENTER_NY, new.z, 1, VIEWPORT_HEIGHT, state)
 
 
-def _relocate_creature(state: GameState, old: Position, new: Position) -> None:
-    """A non-us creature moved from `old` to `new`; update its record."""
+def _clear_transient_block(state: GameState, tile: tuple[int, int, int]) -> bool:
+    """Drop a RUNTIME block on `tile` if one is set. True if we cleared something.
+
+    Called when a creature vacates a tile (moves off it or dies/leaves view on it). A
+    tile a creature was standing on is, by definition, walkable ground — a creature can't
+    occupy a wall — so any block sitting on it was only ever the creature getting in our
+    way (a rejected/ignored step while it stood there). Once it's gone, that block is a
+    lie, and waiting out the 12s TTL just leaves us pathing around empty floor and, at
+    worst, walling ourselves into the corner the creature had us pinned in.
+
+    We clear ONLY transient blocks — those with a `blocked_expiry` entry. Colony hazards
+    (teleport/stair sources) are added to `blocked_tiles` WITHOUT an expiry precisely so
+    they're never auto-pruned; a creature standing on a teleport must not let us clear the
+    avoid and walk into it. Keying off the expiry map keeps hazards untouched.
+    """
+    if tile in state.blocked_expiry:
+        state.blocked_tiles.discard(tile)
+        del state.blocked_expiry[tile]
+        return True
+    return False
+
+
+def _relocate_creature(state: GameState, old: Position, new: Position) -> bool:
+    """A non-us creature moved from `old` to `new`; update its record. True if we found it.
+
+    The awkward constraint: a 0x6D carries NO creature id — just (oldPos, oldStackpos,
+    newPos) — so where a creature stood is the only handle we have for deciding who moved.
+    That makes this inherently best-effort, and the job here is to stop ONE bad guess from
+    snowballing into a permanently drifting picture of the monsters around us:
+
+      - Never match OURSELVES. Our position comes from the slice-confirmed 0x6D (the one
+        authoritative source, see the OP_SLICE branch); letting a bare creature-move drag
+        our own record around corrupts the very thing everything else trusts.
+      - Clear ghosts off the DESTINATION. Two creatures cannot share a tile, so anything
+        still recorded on `new` is a leftover from an update we missed. Left alone it would
+        absorb the next move aimed at that tile, and the error compounds silently. We only
+        do this once we've positively identified the mover, so a miss can't make us delete
+        a record that might still be good.
+      - Count what we could not attribute, instead of returning silently. A miss means some
+        creature is now frozen at a stale tile in our model; without a counter that damage
+        is invisible, which is exactly how ragged monster tracking went unnoticed.
+    """
+    src = (old.x, old.y, old.z)
+    dst = (new.x, new.y, new.z)
+
+    mover = None
     for creature in state.creatures.values():
-        if creature.position is not None and (creature.position.x, creature.position.y, creature.position.z) == (old.x, old.y, old.z):
-            creature.position = Position(new.x, new.y, new.z)
-            return
+        if creature.creature_id == state.player_id:
+            continue                      # our own position is not theirs to move
+        pos = creature.position
+        if pos is not None and (pos.x, pos.y, pos.z) == src:
+            mover = creature
+            break
+
+    if mover is None:
+        # Something moved onto `dst` that we don't have tracked. We deliberately do NOT
+        # evict whatever we think is there: without having identified the mover we can't
+        # tell a ghost from a real creature whose position we simply got wrong, and
+        # dropping a live monster is worse than holding a stale one (it would stop
+        # blocking pathfinding and stop being a melee target).
+        state.creature_move_misses += 1
+        return False
+
+    for cid in [c.creature_id for c in state.creatures.values()
+                if c is not mover and c.creature_id != state.player_id
+                and c.position is not None
+                and (c.position.x, c.position.y, c.position.z) == dst]:
+        del state.creatures[cid]
+        state.creature_ghosts_dropped += 1
+
+    mover.position = Position(new.x, new.y, new.z)
+    # The creature just vacated `src`. If we'd blocked that tile because it was standing
+    # there in our way, free it now instead of pathing around empty floor for 12s.
+    _clear_transient_block(state, src)
+    return True
 
 
 def _prune_distant_creatures(state: GameState) -> None:
@@ -543,10 +640,16 @@ def process_world_frame(payload: bytes, state: GameState, item_flags: ItemFlags)
         elif opcode == OP_REMOVE_THING:
             pos = Position(reader.u16(), reader.u16(), reader.u8())
             reader.u8()  # stack position
-            for cid in [c.creature_id for c in state.creatures.values()
-                        if c.position is not None and (c.position.x, c.position.y, c.position.z) == (pos.x, pos.y, pos.z)
-                        and c.creature_id != state.player_id]:
+            removed = [c.creature_id for c in state.creatures.values()
+                       if c.position is not None and (c.position.x, c.position.y, c.position.z) == (pos.x, pos.y, pos.z)
+                       and c.creature_id != state.player_id]
+            for cid in removed:
                 del state.creatures[cid]
+            # A creature died or left this tile (the common case: WE just killed it). The
+            # tile is walkable again, so drop any transient block we'd put there while it
+            # was in our way — don't make the bot wait out the TTL on now-empty floor.
+            if removed:
+                _clear_transient_block(state, (pos.x, pos.y, pos.z))
         elif opcode == OP_MAGIC_EFFECT:
             reader.u16(); reader.u16(); reader.u8()  # position (5 bytes)
             reader.u16()                             # effect id (u16, our profile)
@@ -638,13 +741,30 @@ def process_world_frame(payload: bytes, state: GameState, item_flags: ItemFlags)
             # AddWorldLight: level u8 + colour u8. Global day/night tick — batches widely.
             reader.u8(); reader.u8()
         elif opcode == 0x6B:
-            # sendCreatureTurn: pos(x u16,y u16,z u8) + stackpos u8 + 0x63 u16 + id u32
-            # + direction u8. (walk-through byte only for version>=953, so not here.)
+            # 0x6B is TWO different messages sharing one opcode, and the u16 after the
+            # stackpos is what tells them apart:
+            #   marker == 0x0063 -> sendCreatureTurn: + creature id u32 + direction u8
+            #   otherwise        -> sendUpdateTileItem: that u16 IS the item id
+            #
+            # We used to always assume the creature-turn form and consume 13 payload
+            # bytes. On a tile-item update the real payload is 8, so we over-read by 5 and
+            # landed mid-message — and since a desync makes the next byte read look like a
+            # garbage opcode, we bailed and threw away the REST of that batched frame,
+            # creature-moves included. Captured off the wire:
+            #   6b | 85 7e 39 7e 07 | 04 | 50 17 | 6c ...
+            # marker 0x1750 = an item id, and the next real opcode (0x6C) sits exactly 9
+            # bytes in — the 5 bytes we were overshooting by.
             reader.u16(); reader.u16(); reader.u8()   # position
             reader.u8()                                # stack position
-            reader.u16()                               # 0x63 sub-marker
-            reader.u32()                               # creature id
-            reader.u8()                                # direction
+            marker = reader.u16()
+            if marker == 0x0063:
+                reader.u32()                           # creature id
+                reader.u8()                            # direction
+            else:
+                # A tile item changed. `marker` was its id; stackable/liquid items carry
+                # the usual trailing count/subtype byte.
+                for _ in range(item_flags.extra_bytes(marker)):
+                    reader.u8()
         elif opcode == 0x8F:
             # sendChangeSpeed: id u32 + speed u16. (baseSpeed u16 only for !oldProtocol.)
             reader.u32(); reader.u16()
@@ -718,9 +838,30 @@ def process_world_frame(payload: bytes, state: GameState, item_flags: ItemFlags)
             reader.u8()        # magic level percent
             reader.u8()        # soul
             reader.u16()       # stamina minutes
+        elif opcode == OP_PLAYER_SKILLS:
+            # Our seven classic skills (AddPlayerSkills): fist, club, sword, axe,
+            # distance, shielding, fishing — each a (level u8, percent-to-next u8) pair,
+            # so 14 bytes. MEASURED, not assumed: captured frames read
+            # `a1 0a 06 0a 00 0a 00 0a 00 0a 00 0a 00 0a 00` and the very next byte is
+            # 0xA0, the player-stats packet the server sends alongside — which lands
+            # exactly at +14. We don't use skills yet; the point is simply not to abandon
+            # the rest of the frame (see the `else` branch below for why that hurts).
+            reader.skip(14)
+        elif opcode == OP_CANCEL_TARGET:
+            # The server clearing our attack target — it died, or left our view. Captured
+            # frames are exactly `a3 00 00 00 00`, i.e. a single u32 (always 0 here).
+            #
+            # This one bit us specifically: bots now melee, so 0xA3 fires on every kill,
+            # and bailing on it threw away everything batched BEHIND it in the same frame
+            # — including the 0x6D creature-moves. That is why monsters appeared to freeze
+            # or skip around. Consuming it keeps those moves.
+            reader.u32()
+            result.target_cancelled = True
         else:
-            # No handler: stop here and let the next frame resync us.
+            # No handler: stop here and let the next frame resync us. Record WHERE, so the
+            # frame tail can be dumped and the message's true length derived empirically.
             result.bailed_opcode = opcode
+            result.bailed_offset = reader.pos - 1     # the opcode byte itself
             break
 
     # A 0x6D still pending at frame end had no slice after it -> a creature's move.

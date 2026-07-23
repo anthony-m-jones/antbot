@@ -310,6 +310,30 @@ class ColonyManager:
         else:
             log.warning("manager: DB reset failed: %s", (result.stderr or "").strip()[:200])
 
+    async def teleport(self, name: str, x: int, y: int, z: int) -> None:
+        """DB-teleport ONE character to (x, y, z). A debugging tool, not a bot power.
+
+        Same mechanism as `_reset_positions`: a character's stored position only takes
+        effect at LOGIN (the server loads it then, and overwrites it on logout), so the
+        target must be OFFLINE when this runs — you teleport it, THEN log in with the OT
+        client to watch. The intended use is parking an inspection character (default
+        Testerrino) right next to a bot to see in real time what that bot is doing. The
+        swarm itself never calls this; bots move by walking, under normal-player rules.
+        """
+        container, user, password, dbname = self._db
+        safe = name.replace("'", "").strip() or "Testerrino"
+        sql = (f"UPDATE players SET posx={int(x)}, posy={int(y)}, posz={int(z)} "
+               f"WHERE name='{safe}';")
+        cmd = ["docker", "exec", container, "mariadb", f"-u{user}", f"-p{password}",
+               dbname, "-e", sql]
+        result = await self.loop.run_in_executor(
+            None, lambda: subprocess.run(cmd, capture_output=True, text=True))
+        if result.returncode == 0:
+            log.info("manager: teleported %s to (%d,%d,%d) — log in to see it",
+                     safe, int(x), int(y), int(z))
+        else:
+            log.warning("manager: teleport failed: %s", (result.stderr or "").strip()[:200])
+
     # -- command entry point from the dashboard thread --------------------
 
     def command(self, action: str, params: dict | None = None) -> dict:
@@ -335,6 +359,17 @@ class ColonyManager:
                 return {"error": "nothing to start (0 scouts, 0 wanderers, 0 haulers)"}
             def coro_factory(s=scouts, w=wanderers, h=haulers):
                 return self.start(s, w, h)
+        elif action == "teleport":
+            # Debug tool: park an inspection character (default Testerrino) at a clicked
+            # tile so it can be logged in beside a bot. Needs x/y/z from the click.
+            name = (params.get("name", ["Testerrino"])[0] or "Testerrino")
+            try:
+                tx, ty, tz = (int(params["x"][0]), int(params["y"][0]),
+                              int(params["z"][0]))
+            except (KeyError, ValueError, IndexError):
+                return {"error": "teleport needs x, y, z"}
+            def coro_factory(n=name, x=tx, y=ty, z=tz):
+                return self.teleport(n, x, y, z)
         else:
             actions = {"stop": self.stop_all, "reset": self.reset_to_temple}
             coro_factory = actions.get(action)

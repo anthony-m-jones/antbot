@@ -167,12 +167,23 @@ class BotView:
     # dashboard draws both so that difference is visible at a glance.
     goal: tuple[int, int, int] | None = None
     plan: list = dataclasses.field(default_factory=list)
+    # Which pathfinder set `plan` (or last failed): "shared" (find_route over the colony
+    # map) or "local" (find_path_toward over the bot's own view). Lets the dashboard name
+    # WHICH planner is responsible for a bot's current move or its no-route state.
+    plan_source: str = ""
     # Debug overlay inputs (only meaningful for the focused bot). `blocked` is this
     # bot's runtime-refused tiles as (x, y, z, remaining_ttl); `creatures` is the tiles
     # creatures occupy on its floor. Both are per-bot and live, unlike the colony-wide
     # hazard/unreachable sets, which is exactly the distinction the block inspector draws.
     blocked: list = dataclasses.field(default_factory=list)
     creatures: list = dataclasses.field(default_factory=list)
+    # Recent (time, phase, why) decisions — the bot's "brain" for the dashboard, so a
+    # loop is visible as a repeating pattern of decisions rather than just a jittering dot.
+    decisions: list = dataclasses.field(default_factory=list)
+    # Creature-tracking health from the bot's parser: {"move_misses": n, "ghosts": n}.
+    # A climbing move_misses means our picture of the monsters around this bot is drifting
+    # — the failure that used to be completely invisible. See world._relocate_creature.
+    tracking: dict = dataclasses.field(default_factory=dict)
 
     @property
     def stuck(self) -> bool:
@@ -208,6 +219,9 @@ class Colony:
         # with the rest of the world knowledge — it's a fact about the map, and
         # re-learning it costs a wasted trip every restart.
         self._unreachable: set[tuple[int, int, int]] = set()
+        # name -> live GameSession, for the dashboard's packet inspector (toggle capture,
+        # read frames). The bot registers itself each report; latest per name wins.
+        self._sessions: dict = {}
         # tile -> the bots that have failed to reach it (see report_unreachable). Not
         # persisted: it's evidence in progress, not a conclusion.
         self._unreachable_hits: dict[tuple[int, int, int], set] = {}
@@ -228,6 +242,14 @@ class Colony:
         # tile -> what it costs to cross (Tibia groundSpeed; bigger = slower). Filled in
         # by contribute_tiles, consumed by the router so routes prefer roads over sand.
         self._walk_cost: dict[tuple[int, int, int], int] = {}
+        # SHARED exploration frontier (feature A). `_seen` is every slot ANY bot has had
+        # the server describe — including empty void/open-air slots, which is what tells a
+        # real unexplored edge from a cliff we can already see past. `_frontiers` is the
+        # walkable tiles bordering something still unseen: the swarm's collective "here's
+        # what's left to explore", so no bot re-checks an area another already finished.
+        # Both maintained incrementally in contribute_tiles.
+        self._seen: set[tuple[int, int, int]] = set()
+        self._frontiers: set[tuple[int, int, int]] = set()
         # Tiles that whisk you away — stairs/ramps/holes (floor change) or
         # teleporters (position jump). We can't spot these from item data ahead of
         # time (the modern assets don't flag floor-change, and teleport
@@ -246,6 +268,15 @@ class Colony:
         # and it didn't relocate us) — never trust or re-add these. This is how a
         # mis-recorded teleport source gets pruned so routing stops relying on it.
         self._bad_links: set[tuple[int, int, int]] = set()
+        # STEP-type floor-changes (a hole/open-stairs/teleporter — walking onto it
+        # relocates you instantly, unlike a ladder's deliberate "use") that some bot has
+        # SEEN but nobody has actually crossed yet, so there's no `_links` entry for them.
+        # `find_path_toward`/`find_route` price a tile in this set at
+        # `nav.unconfirmed_step_cost` — an honest, optimistic lower bound — instead of its
+        # ordinary ground cost, so a route that avoids it wins when a cheaper one exists,
+        # but crossing it is never forbidden outright. The moment a tile here is actually
+        # crossed it becomes a real `_links` entry and is removed — see report_link.
+        self._step_unconfirmed: set[tuple[int, int, int]] = set()
         # Learned item-id -> object category (teleporter/stairs/...), so the colony
         # can recognise shortcut objects on sight. Shared by all bots. We seed it
         # from Canary's items.xml (ground truth: names + floorchange/type keyed by
@@ -265,6 +296,12 @@ class Colony:
                 self.catalog = load_item_catalog(catalog_file)
                 self.traversal.seed_from_catalog(self.catalog)
                 self.traversal.seed_curated()  # Lua-script objects items.xml misses
+                # Sewer grates carry no floorchange/type and no Lua — the descend is
+                # baked into the map. items.xml only NAMES them, so seed by name and let a
+                # scout try them on sight ("jammed" ones are described as immovable, so we
+                # don't waste a trial on them).
+                self.traversal.seed_by_name(self.catalog, "sewer grate", "grate",
+                                            exclude=("jammed",))
                 # Teach walkability that open water / lava ground is impassable, even
                 # though appearances.dat under-flags it. Shared item_flags object, so
                 # this reaches every bot's pathfinding too.
@@ -352,11 +389,12 @@ class Colony:
                    hp: int | None = None, max_hp: int | None = None,
                    mana: int | None = None, max_mana: int | None = None,
                    level: int | None = None, role: str = "scout",
-                   goal=None, plan=None, blocked=None, creatures=None) -> None:
+                   goal=None, plan=None, plan_source="", blocked=None,
+                   creatures=None, decisions=None, tracking=None) -> None:
         """Record where a bot is now, its vitals, and what it's trying to do.
 
-        `goal`/`plan` drive the intent overlay; `blocked`/`creatures` the block
-        inspector — see BotView.
+        `goal`/`plan` drive the intent overlay; `plan_source` names which pathfinder
+        produced it; `blocked`/`creatures` the block inspector — see BotView.
         """
         if position is None:
             return
@@ -367,8 +405,11 @@ class Colony:
                                        max_mana=max_mana, level=level,
                                        goal=tuple(goal) if goal else None,
                                        plan=list(plan or []),
+                                       plan_source=plan_source or "",
                                        blocked=list(blocked or []),
-                                       creatures=list(creatures or []))
+                                       creatures=list(creatures or []),
+                                       decisions=list(decisions or []),
+                                       tracking=dict(tracking or {}))
 
     def bot_positions(self) -> dict:
         """{bot name -> (x, y, z)} for every bot currently reporting. Used by the
@@ -674,6 +715,7 @@ class Colony:
         """
         added = 0
         with self._lock:
+            newly_walkable: list[tuple[int, int, int]] = []
             for (x, y, z), items in state.tiles.items():
                 if (x, y, z) in self._explored:
                     continue
@@ -685,14 +727,160 @@ class Colony:
                 ground_ok = ids[0] not in self._item_flags.impassable_ground
                 if ground_ok and not any(self._item_flags.is_blocking(item_id) for item_id in ids):
                     self._walkable.add((x, y, z))  # feeds the world-wide router
+                    newly_walkable.append((x, y, z))
                     # What this tile costs to cross, so the router can prefer roads.
                     # Recorded here because this is the only place that still has the
                     # tile's ITEMS — `_walkable` is just coordinates by the time the
                     # router sees it. See nav.tile_cost for why bigger means slower.
                     speed = self._item_flags.ground_speed(ids[0])
                     self._walk_cost[(x, y, z)] = speed or _DEFAULT_GROUND_SPEED
+                # A recognized STEP-type object (walking onto it relocates you — a
+                # ladder is USE-type and safe to ignore here, since merely walking near
+                # one does nothing). If we haven't actually crossed it yet (no `_links`
+                # entry), flag it for the OPTIMISTIC-cost treatment in find_path_toward/
+                # find_route instead of leaving it priced as ordinary ground.
+                if (x, y, z) not in self._links:
+                    hit = self.traversal.classify(ids)
+                    if hit is not None:
+                        kind = self.traversal.kind(hit[0])
+                        if kind is not None and kind.action == "step":
+                            self._step_unconfirmed.add((x, y, z))
                 added += 1
+            # Fold the bot's newly-seen slots (delta) into the shared seen set, then
+            # refresh only the frontiers that could have changed (cheap, local).
+            newly_seen = [s for s in state.newly_seen if s not in self._seen]
+            self._seen.update(newly_seen)
+            state.newly_seen.clear()
+            self._refresh_frontiers(newly_walkable, newly_seen)
         return added
+
+    _NEI = ((0, -1), (1, 0), (0, 1), (-1, 0))
+
+    def _has_unseen_neighbour(self, tile: tuple[int, int, int]) -> bool:
+        x, y, z = tile
+        return any((x + dx, y + dy, z) not in self._seen for dx, dy in self._NEI)
+
+    def _refresh_frontiers(self, newly_walkable, newly_seen) -> None:
+        """Re-evaluate frontier status for only the tiles a change could have touched.
+
+        A frontier is a walkable tile with a still-unseen 4-neighbour. Two events move a
+        tile in or out of the set: a newly-WALKABLE tile may itself be a frontier, and a
+        newly-SEEN slot may have been the last unseen neighbour of a walkable tile next to
+        it (resolving it). So we only re-check the new walkable tiles and the walkable
+        neighbours of new seen slots — O(delta), not O(map). Caller holds the lock.
+        """
+        candidates = set(newly_walkable)
+        for (sx, sy, sz) in newly_seen:
+            for dx, dy in self._NEI:
+                n = (sx + dx, sy + dy, sz)
+                if n in self._walkable:
+                    candidates.add(n)
+        for c in candidates:
+            if c in self._walkable and self._has_unseen_neighbour(c):
+                self._frontiers.add(c)
+            else:
+                self._frontiers.discard(c)
+
+    def shared_seen(self) -> set:
+        """The live shared 'seen' set (every slot ANY bot has had described).
+
+        Returned by REFERENCE for `find_frontier`'s unseen-check — a snapshot would copy
+        thousands of tiles every scout round. Safe because it's mutated only in
+        `contribute_tiles`, which runs on the same asyncio loop as the scout (no
+        interleaving), and the dashboard thread only ever reads it via locked snapshots.
+        Treat as READ-ONLY.
+        """
+        return self._seen
+
+    def frontiers(self, z: int | None = None) -> set:
+        """A snapshot of open frontier tiles (optionally just floor `z`)."""
+        with self._lock:
+            if z is None:
+                return set(self._frontiers)
+            return {f for f in self._frontiers if f[2] == z}
+
+    def reachable_frontier(self, x: int, y: int, z: int,
+                           skip: set | None = None,
+                           center: tuple[int, int] | None = None,
+                           radius: int | None = None,
+                           max_visit: int = 5000,
+                           avoid: set | None = None) -> tuple[int, int, int] | None:
+        """Nearest open frontier the bot can ACTUALLY reach — walking + known links
+        (ladders/stairs/teleports). Features B + C.
+
+        A capped breadth-first flood from the bot over the shared walkable graph, following
+        `_links` across floors; the first frontier it reaches is the nearest reachable one.
+        This is the whole fix for the wasted balcony/island trips:
+          - a finished region (a balcony that's fully explored) has NO frontiers, so the
+            flood never returns one there and no bot is sent to re-check it;
+          - a walled-off or disconnected room is never reached by the flood, so a scout
+            never targets a place it can't get to;
+          - because the flood follows links, "reach a frontier down the ladder" comes back
+            as a real target the link-aware router (`travel`) can execute.
+
+        `skip` (3-tuples) drops frontiers the caller retired; `center`/`radius` bound a
+        survey. `max_visit` caps the work: if the reachable region is huge and frontier-
+        free, we stop and report None (which correctly means "nothing to explore near me").
+        BFS distance (fewest hops) is a fine proxy for "nearest".
+
+        `avoid` MUST be the same exclusion set the router will use (see `travel`). This
+        flood is the SELECTOR and `find_route` is the EXECUTOR: if the selector is more
+        permissive, it hands out targets the router cannot reach, the trip fails, nothing
+        feeds back, and the bot is offered the identical frontier next round — an infinite
+        loop. So the edge rules below mirror `find_route` exactly: reject an avoided tile
+        BEFORE consulting the links table, take links ahead of plain walkable, and reject
+        an avoided landing. Callers pass hazards+blocked MINUS the links they intend to
+        traverse, exactly as `travel` does.
+        """
+        from collections import deque
+        skip = skip or set()
+        avoid = avoid or set()
+
+        def ok(f):
+            if f in skip or f in avoid:
+                return False
+            if center is not None and radius is not None:
+                if abs(f[0] - center[0]) + abs(f[1] - center[1]) > radius:
+                    return False
+            return True
+
+        # Snapshot the graph under the lock (cheap vs. holding it through the whole flood,
+        # which would block the dashboard thread). Then flood lock-free.
+        with self._lock:
+            walkable = set(self._walkable)
+            links = dict(self._links)
+            frontiers = set(self._frontiers)
+
+        start = (x, y, z)
+        visited = {start}
+        q = deque([start])
+        n = 0
+        while q and n < max_visit:
+            cur = q.popleft()
+            n += 1
+            if cur in frontiers and ok(cur):
+                return cur
+            cx, cy, cz = cur
+            for dx, dy in self._NEI:
+                nb = (cx + dx, cy + dy, cz)
+                # Mirror find_route's edges EXACTLY (see the docstring on `avoid`):
+                # avoided tile rejected first, then links ahead of plain walkable —
+                # stepping onto a link-source tile whisks you to its destination (that's
+                # how a ladder/hole/teleport is traversed — the source itself often isn't
+                # a standable tile) — then the landing checked against `avoid` too.
+                if nb in avoid:
+                    continue
+                if nb in links:
+                    landing = links[nb]
+                elif nb in walkable:
+                    landing = nb
+                else:
+                    continue
+                if landing in avoid or landing in visited:
+                    continue
+                visited.add(landing)
+                q.append(landing)
+        return None
 
     # -- shared hazard learning -------------------------------------------
 
@@ -709,6 +897,7 @@ class Colony:
             changed = source not in self._hazards or self._links.get(source) != dest
             self._hazards.add(source)
             self._links[source] = dest
+            self._step_unconfirmed.discard(source)  # now a real link, not a gamble
             if changed:
                 self._save_knowledge()
 
@@ -722,6 +911,7 @@ class Colony:
             if self._links.get(source) != dest:
                 self._links[source] = dest
                 self._save_knowledge()
+            self._step_unconfirmed.discard(source)
 
     def mark_bad_link(self, source: tuple[int, int, int]) -> None:
         """Travel stepped on `source` and it did NOT relocate us — prune it.
@@ -733,6 +923,14 @@ class Colony:
             self._bad_links.add(source)
             self._links.pop(source, None)
             self._save_knowledge()
+
+    def get_step_unconfirmed(self) -> set[tuple[int, int, int]]:
+        """A copy of the STEP-type floor-changes seen but never crossed — feed to
+        `nav.find_path_toward`/`nav.find_route` so they price a gamble on one honestly
+        instead of either ordinary ground cost (the original bug) or a hard block (which
+        fragments a staircase-dense map)."""
+        with self._lock:
+            return set(self._step_unconfirmed)
 
     def get_hazards(self) -> set[tuple[int, int, int]]:
         """A copy of all known hazard tiles, for a bot to fold into its avoid set."""
@@ -749,10 +947,59 @@ class Colony:
         with self._lock:
             return set(self._walkable)
 
+    def walkable_ref(self) -> set[tuple[int, int, int]]:
+        """The live shared walkable set, returned BY REFERENCE (no copy).
+
+        For `find_path_toward`, which the scout re-runs every single step: copying the
+        whole ~15k-tile set each time (as `get_walkable` does) would tax us hard at
+        scale, and the planner only ever does O(1) membership tests against it. Safe for
+        the same reason as `shared_seen`: `_walkable` is mutated only in
+        `contribute_tiles`, on the same asyncio loop as the planner (no await inside the
+        flood, so no interleaving), and the dashboard thread only reads it under lock.
+        Treat as READ-ONLY.
+        """
+        return self._walkable
+
     def get_walk_costs(self) -> dict[tuple[int, int, int], int]:
         """Per-tile crossing time for the router (see nav.tile_cost). Bigger = slower."""
         with self._lock:
             return dict(self._walk_cost)
+
+    def seed_known(self, walk_costs: dict[tuple[int, int, int], int],
+                   links: dict[tuple[int, int, int], tuple[int, int, int]]) -> None:
+        """Inject pre-known map knowledge directly, as if bots had already explored it.
+
+        This is TEST tooling for the efficiency harness's WARM pass (see
+        navtests.run_efficiency): it hands the colony the fully-revealed region — every
+        walkable tile with its ground speed, plus the floor-change links — so a bot can be
+        scored on ROUTING quality over a known map without first paying for an exploration
+        pass. That makes the warm measurement deterministic and runnable on its own. Normal
+        colony bots never call this; they earn their map by walking it (contribute_tiles).
+
+        Additive and idempotent: tiles/links already known are left as-is, so seeding a
+        colony that a cold pass already populated simply tops it up to the full reveal.
+        """
+        with self._lock:
+            for tile, speed in walk_costs.items():
+                self._walkable.add(tile)
+                self._walk_cost.setdefault(tile, speed)
+                # Show up on the dashboard and count as "seen" so nothing re-explores it.
+                self._explored.setdefault(tile, _DEFAULT_COLOR_INDEX)
+                self._seen.add(tile)
+            for source, dest in links.items():
+                if source not in self._bad_links:
+                    self._links.setdefault(source, dest)
+                    self._hazards.add(source)
+
+    def register_session(self, name: str, session) -> None:
+        """Bind a live bot session by name, for the dashboard's packet inspector."""
+        with self._lock:
+            self._sessions[name] = session
+
+    def session_for(self, name: str):
+        """The live session for `name`, or None. Read from the dashboard's HTTP thread."""
+        with self._lock:
+            return self._sessions.get(name)
 
     def explored_floor(self, z: int) -> list:
         """Every explored tile on floor `z` as [x, y, css-colour] — the whole floor,
@@ -806,6 +1053,55 @@ class Colony:
 
     # -- dashboard reads ---------------------------------------------------
 
+    def overview(self, z: int, block: int = 4) -> dict:
+        """A whole-floor, DOWNSAMPLED view of the explored map.
+
+        The companion to `snapshot`, which deliberately ships only a +/-radius window
+        around the followed bot. That window is why zooming the dashboard out never
+        revealed the colony's true extent — the far tiles weren't being culled by the
+        renderer, they were never sent. But simply widening the window scales the payload
+        with the AREA, and at tens of thousands of tiles that's far too much to put on a
+        400ms poll.
+
+        So this returns every explored tile on floor `z`, collapsed into `block` x `block`
+        cells: the payload scales with area/block^2 (16x smaller at block=4), which is
+        cheap enough to fetch occasionally and draw underneath the detailed window.
+
+        Each cell reports the most common minimap colour inside it — a fair stand-in for
+        the terrain — plus `n`, how many tiles we actually hold there. `n` matters for
+        honesty: a cell we've merely clipped the corner of should not be drawn as
+        confidently as one we've walked every tile of, and the viewer fades it by density.
+        """
+        block = max(1, int(block))
+        # Copy under the lock, then bucket outside it: the dashboard runs on its own
+        # thread, and holding the colony lock across the whole aggregation would stall
+        # the bots' own contribute_tiles calls.
+        with self._lock:
+            tiles = [(x, y, colour) for (x, y, fz), colour in self._explored.items()
+                     if fz == z]
+
+        cells: dict[tuple[int, int], dict[int, int]] = {}
+        for x, y, colour in tiles:
+            key = (x // block * block, y // block * block)
+            counts = cells.setdefault(key, {})
+            counts[colour] = counts.get(colour, 0) + 1
+
+        blocks = []
+        for (bx, by), counts in cells.items():
+            colour = max(counts.items(), key=lambda kv: kv[1])[0]
+            blocks.append([bx, by,
+                           "#%02x%02x%02x" % automap_color_to_rgb(colour),
+                           sum(counts.values())])
+
+        if blocks:
+            xs = [b[0] for b in blocks]
+            ys = [b[1] for b in blocks]
+            bounds = [min(xs), min(ys), max(xs) + block, max(ys) + block]
+        else:
+            bounds = None
+        return {"z": z, "block": block, "blocks": blocks,
+                "bounds": bounds, "tiles": len(tiles)}
+
     def snapshot(self, focus_name: str | None = None, radius: int = 130) -> dict:
         """A JSON-serialisable view for the dashboard.
 
@@ -842,7 +1138,16 @@ class Colony:
                  # it has no route at all (the signature of a "stuck" bot).
                  "goal": list(b.goal) if b.goal else None,
                  "plan": [list(t) for t in b.plan],
-                 "stuck": b.stuck}
+                 "stuck": b.stuck,
+                 # Which pathfinder is steering: "shared" (find_route) or "local"
+                 # (find_path_toward). Lets the UI show which path is causing trouble.
+                 "plan_source": b.plan_source,
+                 # Creature-tracking health (move_misses / ghosts) — see BotView.tracking.
+                 "tracking": b.tracking,
+                 # The decision trace — only for the followed bot, to keep the payload
+                 # small. This is the "watch the brain" panel: recent (t, phase, why).
+                 "decisions": ([[round(t, 1), ph, why] for t, ph, why in b.decisions]
+                               if focus is not None and b.name == focus.name else None)}
                 for b in bots
             ]
             # Live creatures in the window, pooled from every bot's view. Deduped by the
