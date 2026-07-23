@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>antbot — frame viewer</title>
+<!--
+================================================================================
+  antbot frame viewer — one unified timeline: function calls AND the frame-by-
+  frame internals of the searches they run, nested and steppable in one view.
+
+  Reads the JSONL a `tracing.EventRecorder` writes (see `tracing.log_call`,
+  `nav.find_shared_route` / `find_nearest_step_toward`, and
+  `navtests --frame-log`): "call"/"return"/"raise" events for every decorated
+  function, PLUS "start"/"pop"/"relax"/"done"/"no_route" frame events for
+  whichever algorithm ran — all sharing one global `seq` and nested via
+  `call_id`/`parent_id`, so the whole file replays as one call tree: which
+  function called what, what ITS search did internally step by step, and what
+  everything returned.
+
+  Layout: a scrollable call tree (indent = call depth). A call that ran a
+  search (find_shared_route / find_nearest_step_toward) gets a "N frames"
+  badge — click it to expand an inline grid widget scoped to just that call's
+  frames, with its own play/step/scrub controls (see FrameGridWidget). Collapse
+  a call to skip past it and see what happened next, same as any call tree.
+
+  Self-contained: no build step, no CDN, no network — open it directly in a
+  browser and drag a .jsonl file onto it, or run
+  `python -m antbot.frame_viewer path/to/frames.jsonl` to have it opened with
+  the file already loaded (see frame_viewer.py). Same visual language as
+  dashboard.html (near-black canvas, phosphor teal accent, monospace data).
+================================================================================
+-->
+<style>
+  :root{
+    --bg:#0b0c0e; --panel:#101216; --raised:#16191f; --raised-2:#1c2027;
+    --line:rgba(150,170,190,.09); --line-2:rgba(150,170,190,.16); --line-3:rgba(150,170,190,.26);
+    --tx:#c8cfd7; --tx-dim:#828b97; --tx-faint:#565e68;
+    --accent:#35e0c5; --accent-deep:#1b8f80; --accent-glow:rgba(53,224,197,.22);
+    --green:#4bd06a; --amber:#e6b23e; --red:#ef4d52; --blue:#4d9bef; --purple:#b077f0;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+    --r:6px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--tx); font-family:var(--sans);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+
+  /* ---- top bar ---- */
+  header{
+    height:52px; flex:0 0 auto; display:flex; align-items:center; gap:10px;
+    padding:0 16px; background:var(--panel); border-bottom:1px solid var(--line-2);
+  }
+  header h1{font-size:14px; font-weight:600; margin:0; letter-spacing:.02em; white-space:nowrap}
+  header h1 b{color:var(--accent); font-weight:700}
+  .spacer{flex:1}
+  button{
+    font-family:var(--sans); font-size:12px; color:var(--tx); background:var(--raised);
+    border:1px solid var(--line-2); border-radius:var(--r); padding:6px 12px; cursor:pointer;
+  }
+  button:hover{background:var(--raised-2); border-color:var(--line-3)}
+  button:disabled{opacity:.4; cursor:default}
+  button.primary{background:var(--accent-deep); border-color:var(--accent); color:#04211c}
+  button.primary:hover{background:var(--accent)}
+  button.icon{padding:6px 9px; font-size:14px; line-height:1}
+  input[type=file]{display:none}
+  input[type=text]{
+    font-family:var(--mono); font-size:12px; color:var(--tx); background:var(--raised);
+    border:1px solid var(--line-2); border-radius:var(--r); padding:6px 10px; width:220px;
+  }
+  input[type=text]::placeholder{color:var(--tx-faint)}
+
+  /* ---- layout ---- */
+  .body{flex:1; display:flex; min-height:0}
+  #tree-pane{flex:1; overflow:auto; position:relative; background:var(--bg)}
+  .empty{
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; gap:14px; color:var(--tx-dim); text-align:center; padding:24px;
+  }
+  .empty .drop{
+    border:2px dashed var(--line-3); border-radius:12px; padding:40px 60px;
+    font-size:13px; line-height:1.6;
+  }
+  .empty code{color:var(--accent); font-family:var(--mono)}
+  .dragover #tree-pane{outline:2px dashed var(--accent); outline-offset:-2px}
+
+  aside{
+    width:280px; flex:0 0 auto; background:var(--panel); border-left:1px solid var(--line-2);
+    display:flex; flex-direction:column; overflow-y:auto;
+  }
+  aside.hidden{display:none}
+  .section{padding:14px 16px; border-bottom:1px solid var(--line)}
+  .section h2{
+    font-size:10px; text-transform:uppercase; letter-spacing:.08em; color:var(--tx-faint);
+    margin:0 0 10px 0; font-weight:600;
+  }
+  .legend{display:grid; grid-template-columns:auto 1fr; gap:6px 10px; font-size:12px}
+  .swatch{width:14px; height:14px; border-radius:3px; align-self:center}
+  .legend span{color:var(--tx-dim)}
+  .stat-grid{display:grid; grid-template-columns:1fr 1fr; gap:8px}
+  .stat{background:var(--raised); border-radius:var(--r); padding:8px 10px}
+  .stat .n{font-family:var(--mono); font-size:18px; color:var(--accent); line-height:1.2}
+  .stat .l{font-size:10px; color:var(--tx-faint); text-transform:uppercase; letter-spacing:.05em}
+  .hint{font-size:11px; color:var(--tx-faint); line-height:1.5}
+  kbd{
+    font-family:var(--mono); background:var(--raised-2); border:1px solid var(--line-3);
+    border-radius:3px; padding:1px 5px; font-size:10px;
+  }
+
+  /* ---- call tree ---- */
+  .call{position:relative}
+  .call-row{
+    display:flex; align-items:center; gap:8px; padding:3px 10px 3px 0;
+    font-family:var(--mono); font-size:12px; white-space:nowrap; cursor:default;
+    border-left:2px solid transparent;
+  }
+  .call-row:hover{background:var(--raised)}
+  .call-row.raised{border-left-color:var(--red)}
+  .toggle{
+    width:16px; text-align:center; color:var(--tx-faint); cursor:pointer; user-select:none;
+    flex:0 0 auto;
+  }
+  .toggle:hover{color:var(--tx)}
+  .toggle.leaf{visibility:hidden}
+  .qualname{color:var(--tx); font-weight:600}
+  .qualname .cls{color:var(--tx-dim); font-weight:400}
+  .args{color:var(--tx-dim); overflow:hidden; text-overflow:ellipsis}
+  .position-tag{
+    color:var(--tx-faint); background:var(--raised-2); border-radius:3px; padding:0 5px;
+    font-size:11px; flex:0 0 auto;
+  }
+  .result{color:var(--green); flex:0 0 auto}
+  .result.err{color:var(--red)}
+  .duration{color:var(--tx-faint); font-size:11px; flex:0 0 auto}
+  .frame-badge{
+    flex:0 0 auto; background:var(--accent-deep); color:#04211c; border-radius:999px;
+    padding:1px 9px; font-size:11px; font-weight:600; cursor:pointer; border:none;
+    font-family:var(--mono);
+  }
+  .frame-badge:hover{background:var(--accent)}
+  .children{margin-left:20px; border-left:1px solid var(--line); padding-left:4px}
+  .children.collapsed{display:none}
+  .call-row.hidden-by-filter{display:none}
+
+  /* ---- inline frame-grid widget ---- */
+  .grid-widget{
+    margin:6px 0 10px 20px; border:1px solid var(--line-2); border-radius:var(--r);
+    background:var(--panel); overflow:hidden;
+  }
+  .grid-widget .gw-canvas-wrap{overflow:auto; max-height:420px; position:relative; background:var(--bg)}
+  .grid-widget canvas{display:block; image-rendering:pixelated}
+  .grid-widget .gw-transport{
+    display:flex; align-items:center; gap:8px; padding:8px 10px; border-top:1px solid var(--line-2);
+  }
+  .grid-widget .gw-transport input[type=range]{flex:1; accent-color:var(--accent)}
+  .gw-readout{font-family:var(--mono); font-size:11px; color:var(--tx-dim); white-space:nowrap; min-width:110px; text-align:right}
+  .gw-floor-tabs{display:flex; gap:4px; padding:0 10px 8px}
+  .gw-floor-tabs button{padding:2px 8px; font-size:11px}
+  .gw-floor-tabs button.active{background:var(--accent-deep); border-color:var(--accent); color:#04211c}
+  .gw-frame-json{
+    font-family:var(--mono); font-size:11px; color:var(--tx-dim); white-space:pre-wrap;
+    word-break:break-all; margin:0; padding:8px 10px; border-top:1px solid var(--line-2);
+    max-height:140px; overflow:auto;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><b>antbot</b> frame viewer</h1>
+  <button type="button" onclick="document.getElementById('file-input').click()">📂 Open JSONL…</button>
+  <input id="file-input" type="file" accept=".jsonl,.json,.ndjson,.txt">
+  <input id="filter" type="text" placeholder="filter by name / arg / position…">
+  <button id="btn-expand-all">Expand all</button>
+  <button id="btn-collapse-all">Collapse all</button>
+  <div class="spacer"></div>
+  <button id="btn-legend">Legend</button>
+</header>
+
+<div class="body" id="drop-zone">
+  <div id="tree-pane">
+    <div class="empty" id="empty-state">
+      <div class="drop">
+        <div style="font-size:32px; margin-bottom:8px">🧭</div>
+        Drag a <code>.jsonl</code> event log here, or click<br><b>Open JSONL…</b> above.
+        <br><br>
+        Generate one with:<br>
+        <code>python -m antbot.navtests &lt;name&gt; --frame-log</code>
+      </div>
+    </div>
+    <div id="call-tree"></div>
+  </div>
+
+  <aside id="legend-panel" class="hidden">
+    <div class="section">
+      <h2>Call tree</h2>
+      <div class="hint">
+        Each row is one function call, indented by depth. <b style="color:var(--tx-dim)">→</b>
+        shows its return value and duration; a red left border means it raised.
+        Click <span class="toggle" style="visibility:visible;display:inline">▶</span> to
+        collapse/expand a call's children — collapsing skips past everything it did
+        internally, same as stepping over it. A teal <span class="frame-badge"
+        style="cursor:default">N frames</span> badge means this call ran a search
+        (find_shared_route / find_nearest_step_toward) — click it to step through that
+        search frame by frame, inline.
+      </div>
+    </div>
+    <div class="section">
+      <h2>Grid legend (inside an expanded search)</h2>
+      <div class="legend">
+        <div class="swatch" style="background:var(--green)"></div><span>start</span>
+        <div class="swatch" style="background:var(--red)"></div><span>goal</span>
+        <div class="swatch" style="background:var(--accent-deep)"></div><span>settled (popped)</span>
+        <div class="swatch" style="background:rgba(53,224,197,.28); border:1px solid var(--accent)"></div><span>frontier (relaxed, not yet popped)</span>
+        <div class="swatch" style="background:var(--raised-2); border:2px solid #fff"></div><span>current node</span>
+        <div class="swatch" style="background:var(--amber)"></div><span>final path</span>
+        <div class="swatch" style="background:var(--blue)"></div><span>teleport / link edge</span>
+        <div class="swatch" style="background:var(--purple)"></div><span>gambled (unconfirmed crossing)</span>
+      </div>
+    </div>
+    <div class="section">
+      <h2>File totals</h2>
+      <div class="stat-grid" id="file-stats">
+        <div class="stat"><div class="n" id="stat-calls">0</div><div class="l">calls</div></div>
+        <div class="stat"><div class="n" id="stat-searches">0</div><div class="l">searches</div></div>
+        <div class="stat"><div class="n" id="stat-events">0</div><div class="l">total events</div></div>
+        <div class="stat"><div class="n" id="stat-roots">0</div><div class="l">top-level calls</div></div>
+      </div>
+    </div>
+    <div class="section hint">
+      <b style="color:var(--tx-dim)">Keys:</b> type in the filter box to narrow by
+      qualname, arg, or position (e.g. "32385" or "find_shared_route"). Ancestors of a
+      match stay visible so you can see how you got there.
+    </div>
+  </aside>
+</div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Parsing: flat JSONL -> a call tree (nodes keyed by call_id), with each
+// frame-emitting event attached to the call that produced it.
+// ---------------------------------------------------------------------------
+function parseJsonl(text) {
+  const out = [];
+  let bad = 0;
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try { out.push(JSON.parse(t)); } catch (e) { bad++; }
+  }
+  if (bad) console.warn(`frame viewer: skipped ${bad} unparsable line(s)`);
+  return out;
+}
+
+// A CallNode: {callId, parentId, depth, qualname, args, kwargs, position,
+//              returnEvent, raiseEvent, frames: [...], children: [...]}
+function buildCallTree(events) {
+  const byId = new Map();
+  const roots = [];
+  let searchCount = 0;
+
+  for (const e of events) {
+    if (e.kind === "call") {
+      const node = {
+        callId: e.call_id, parentId: e.parent_id, depth: e.depth ?? 0,
+        qualname: e.qualname, args: e.args || [], kwargs: e.kwargs || {},
+        position: e.position || null, returnEvent: null, raiseEvent: null,
+        frames: [], children: [],
+      };
+      byId.set(e.call_id, node);
+      if (e.parent_id != null && byId.has(e.parent_id)) {
+        byId.get(e.parent_id).children.push(node);
+      } else {
+        roots.push(node);
+      }
+    } else if (e.kind === "return") {
+      const node = byId.get(e.call_id);
+      if (node) node.returnEvent = e;
+    } else if (e.kind === "raise") {
+      const node = byId.get(e.call_id);
+      if (node) node.raiseEvent = e;
+    } else {
+      // A frame event (start/pop/relax/done/no_route) — attach to its owning call.
+      const node = e.call_id != null ? byId.get(e.call_id) : null;
+      if (node) {
+        node.frames.push(e);
+        if (e.kind === "start") searchCount++;
+      }
+    }
+  }
+  return { roots, byId, callCount: byId.size, searchCount };
+}
+
+// ---------------------------------------------------------------------------
+// find_nearest_step_toward's "done" event has NO resolved tile route (just
+// direction strings + a target) — walk it from `start` to get real tiles.
+// find_shared_route's "done" already has resolved [dir, teleport, [x,y,z]] triples.
+// ---------------------------------------------------------------------------
+const DIRECTION_DELTAS = { north: [0, -1], east: [1, 0], south: [0, 1], west: [-1, 0] };
+function toXYZ(arr, fallbackZ) {
+  if (!arr) return null;
+  return { x: arr[0], y: arr[1], z: arr.length > 2 ? arr[2] : fallbackZ };
+}
+function reconstructPath(doneFrame, fallbackStart, fallbackZ) {
+  if (Array.isArray(doneFrame.route)) {
+    return doneFrame.route.map(step => toXYZ(step[2], fallbackZ));
+  }
+  if (Array.isArray(doneFrame.path)) {
+    const start = toXYZ(doneFrame.start || fallbackStart, fallbackZ);
+    if (!start) return null;
+    let { x, y, z } = start;
+    const tiles = [{ x, y, z }];
+    for (const dir of doneFrame.path) {
+      const d = DIRECTION_DELTAS[dir];
+      if (!d) continue;
+      x += d[0]; y += d[1];
+      tiles.push({ x, y, z });
+    }
+    return tiles;
+  }
+  return null;
+}
+
+function key(x, y, z) { return x + "," + y + "," + z; }
+function getCss(varName) { return getComputedStyle(document.documentElement).getPropertyValue(varName).trim(); }
+
+// ---------------------------------------------------------------------------
+// FrameGridWidget — the inline, per-call grid + scrubber. Everything the old
+// single-instance viewer did globally now lives on `this`, so any number of
+// these can be expanded side by side without fighting over shared state.
+// ---------------------------------------------------------------------------
+class FrameGridWidget {
+  constructor(container, frames) {
+    this.container = container;
+    this.frames = frames;
+    const startFrame = frames.find(f => f.kind === "start") || {};
+    this.algo = startFrame.algo || "?";
+    this.fallbackZ = (startFrame.start && startFrame.start.length > 2) ? startFrame.start[2] : 0;
+    this.start = toXYZ(startFrame.start, this.fallbackZ);
+    this.goal = toXYZ(startFrame.goal, this.fallbackZ);
+    this.frameIdx = 0;
+    this.floorIdx = 0;
+    this.zoom = 16;
+    this.floors = this._floors();
+    this._buildDom();
+    this.render();
+  }
+
+  _floors() {
+    const zs = new Set();
+    const consider = (arr) => { const p = toXYZ(arr, this.fallbackZ); if (p) zs.add(p.z); };
+    for (const f of this.frames) {
+      consider(f.node); consider(f.landing); consider(f.start); consider(f.goal); consider(f.target);
+    }
+    if (zs.size === 0) zs.add(this.fallbackZ);
+    return [...zs].sort((a, b) => a - b);
+  }
+
+  _bbox(z) {
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    const consider = (arr) => {
+      const p = toXYZ(arr, this.fallbackZ);
+      if (!p || p.z !== z) return;
+      minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+      minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+    };
+    for (const f of this.frames) {
+      consider(f.node); consider(f.landing); consider(f.start); consider(f.goal); consider(f.target);
+    }
+    if (!isFinite(minX)) minX = maxX = minY = maxY = 0;
+    const pad = 2;
+    return { minX: minX - pad, maxX: maxX + pad, minY: minY - pad, maxY: maxY + pad };
+  }
+
+  _computeState(upTo) {
+    const visited = new Map(), frontier = new Map();
+    let current = null, path = null;
+    const stats = { pops: 0, relax: 0, improved: 0, gambles: 0 };
+    for (let i = 0; i <= upTo && i < this.frames.length; i++) {
+      const f = this.frames[i];
+      if (f.kind === "pop") {
+        const n = toXYZ(f.node, this.fallbackZ);
+        const k = key(n.x, n.y, n.z);
+        visited.set(k, { node: n });
+        frontier.delete(k);
+        current = n;
+        stats.pops++;
+      } else if (f.kind === "relax") {
+        stats.relax++;
+        if (f.gamble) stats.gambles++;
+        if (f.improved) {
+          stats.improved++;
+          const n = toXYZ(f.landing, this.fallbackZ);
+          const k = key(n.x, n.y, n.z);
+          if (!visited.has(k)) frontier.set(k, { node: n, teleport: !!f.teleport, gamble: !!f.gamble });
+          current = toXYZ(f.node, this.fallbackZ) || current;
+        }
+      } else if (f.kind === "done") {
+        path = reconstructPath(f, this.start ? [this.start.x, this.start.y, this.start.z] : null, this.fallbackZ);
+      }
+    }
+    return { visited, frontier, current, path, stats };
+  }
+
+  _buildDom() {
+    const el = document.createElement("div");
+    el.className = "grid-widget";
+    el.innerHTML = `
+      <div class="gw-floor-tabs"></div>
+      <div class="gw-canvas-wrap"><canvas></canvas></div>
+      <div class="gw-transport">
+        <button class="icon gw-first" title="First frame">⏮</button>
+        <button class="icon gw-prev" title="Step back (when focused)">◀</button>
+        <button class="icon primary gw-play" title="Play/Pause">▶</button>
+        <button class="icon gw-next" title="Step forward">▶</button>
+        <button class="icon gw-last" title="Last frame">⏭</button>
+        <input type="range" class="gw-scrubber" min="0" value="0">
+        <span class="gw-readout"></span>
+      </div>
+      <pre class="gw-frame-json"></pre>
+    `;
+    this.container.appendChild(el);
+    this.el = el;
+    this.canvas = el.querySelector("canvas");
+    this.ctx = this.canvas.getContext("2d");
+    this.scrubber = el.querySelector(".gw-scrubber");
+    this.scrubber.max = this.frames.length - 1;
+    this.readout = el.querySelector(".gw-readout");
+    this.frameJson = el.querySelector(".gw-frame-json");
+    this.floorTabsEl = el.querySelector(".gw-floor-tabs");
+    this.playing = false;
+    this.playTimer = null;
+
+    this._rebuildFloorTabs();
+    el.querySelector(".gw-first").onclick = () => this._stop() || this.setFrame(0);
+    el.querySelector(".gw-prev").onclick = () => this._stop() || this.setFrame(this.frameIdx - 1);
+    el.querySelector(".gw-next").onclick = () => this._stop() || this.setFrame(this.frameIdx + 1);
+    el.querySelector(".gw-last").onclick = () => this._stop() || this.setFrame(this.frames.length - 1);
+    el.querySelector(".gw-play").onclick = () => this._togglePlay();
+    this.scrubber.addEventListener("input", (e) => { this._stop(); this.setFrame(parseInt(e.target.value, 10)); });
+  }
+
+  _rebuildFloorTabs() {
+    this.floorTabsEl.innerHTML = "";
+    if (this.floors.length <= 1) return;
+    this.floors.forEach((z, i) => {
+      const b = document.createElement("button");
+      b.textContent = "z=" + z;
+      if (i === this.floorIdx) b.classList.add("active");
+      b.onclick = () => { this.floorIdx = i; this._rebuildFloorTabs(); this.render(); };
+      this.floorTabsEl.appendChild(b);
+    });
+  }
+
+  setFrame(i) {
+    this.frameIdx = Math.max(0, Math.min(this.frames.length - 1, i));
+    this.render();
+  }
+
+  _stop() {
+    this.playing = false;
+    this.el.querySelector(".gw-play").textContent = "▶";
+    if (this.playTimer) { clearInterval(this.playTimer); this.playTimer = null; }
+    return false;
+  }
+
+  _togglePlay() {
+    if (this.playing) { this._stop(); return; }
+    this.playing = true;
+    this.el.querySelector(".gw-play").textContent = "⏸";
+    this.playTimer = setInterval(() => {
+      if (this.frameIdx >= this.frames.length - 1) { this._stop(); return; }
+      this.setFrame(this.frameIdx + 1);
+    }, 100);
+  }
+
+  render() {
+    const z = this.floors[this.floorIdx];
+    const box = this._bbox(z);
+    const cell = this.zoom;
+    const cols = box.maxX - box.minX + 1;
+    const rows = box.maxY - box.minY + 1;
+    this.canvas.width = cols * cell;
+    this.canvas.height = rows * cell;
+    const ctx = this.ctx;
+
+    ctx.fillStyle = getCss("--bg");
+    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    ctx.strokeStyle = getCss("--line");
+    ctx.lineWidth = 1;
+    for (let c = 0; c <= cols; c++) { ctx.beginPath(); ctx.moveTo(c * cell + .5, 0); ctx.lineTo(c * cell + .5, this.canvas.height); ctx.stroke(); }
+    for (let r = 0; r <= rows; r++) { ctx.beginPath(); ctx.moveTo(0, r * cell + .5); ctx.lineTo(this.canvas.width, r * cell + .5); ctx.stroke(); }
+
+    const cellAt = (x, y) => [(x - box.minX) * cell, (y - box.minY) * cell];
+    const fillTile = (x, y, color, inset = 1) => {
+      const [px, py] = cellAt(x, y);
+      ctx.fillStyle = color;
+      ctx.fillRect(px + inset, py + inset, cell - inset * 2, cell - inset * 2);
+    };
+    const ringTile = (x, y, color, width = 2) => {
+      const [px, py] = cellAt(x, y);
+      ctx.strokeStyle = color; ctx.lineWidth = width;
+      ctx.strokeRect(px + width / 2, py + width / 2, cell - width, cell - width);
+    };
+
+    const state = this._computeState(this.frameIdx);
+
+    for (const { node, teleport, gamble } of state.frontier.values()) {
+      if (node.z !== z) continue;
+      fillTile(node.x, node.y, "rgba(53,224,197,.22)");
+      if (teleport) ringTile(node.x, node.y, getCss("--blue"), 2);
+      else if (gamble) ringTile(node.x, node.y, getCss("--purple"), 2);
+    }
+    for (const { node } of state.visited.values()) {
+      if (node.z !== z) continue;
+      fillTile(node.x, node.y, getCss("--accent-deep"));
+    }
+    if (state.path) {
+      ctx.globalAlpha = .9;
+      for (const p of state.path) { if (p && p.z === z) fillTile(p.x, p.y, getCss("--amber"), 3); }
+      ctx.globalAlpha = 1;
+    }
+    if (this.start && this.start.z === z) ringTile(this.start.x, this.start.y, getCss("--green"), 3);
+    if (this.goal && this.goal.z === z) ringTile(this.goal.x, this.goal.y, getCss("--red"), 3);
+    if (state.current && state.current.z === z) ringTile(state.current.x, state.current.y, "#ffffff", 3);
+
+    this.scrubber.value = this.frameIdx;
+    this.readout.textContent = `frame ${this.frameIdx + 1} / ${this.frames.length}  ·  `
+      + `${state.stats.pops} popped, ${state.stats.relax} relaxed, ${state.stats.gambles} gambles`;
+    this.frameJson.textContent = JSON.stringify(this.frames[this.frameIdx], null, 1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Call tree DOM rendering
+// ---------------------------------------------------------------------------
+let TREE = null;   // {roots, byId, callCount, searchCount}
+const widgets = new Map(); // callId -> FrameGridWidget, for calls currently expanded
+
+function qualnameParts(qualname) {
+  const dot = qualname.lastIndexOf(".");
+  return dot === -1 ? { cls: null, name: qualname } : { cls: qualname.slice(0, dot), name: qualname.slice(dot + 1) };
+}
+
+function renderCallNode(node, parentEl) {
+  const wrap = document.createElement("div");
+  wrap.className = "call";
+
+  const row = document.createElement("div");
+  row.className = "call-row" + (node.raiseEvent ? " raised" : "");
+  const hasKids = node.children.length > 0;
+  const hasFrames = node.frames.some(f => f.kind === "start");
+
+  const toggle = document.createElement("span");
+  toggle.className = "toggle" + (hasKids ? "" : " leaf");
+  toggle.textContent = hasKids ? "▼" : "•";
+  row.appendChild(toggle);
+
+  const { cls, name } = qualnameParts(node.qualname);
+  const qn = document.createElement("span");
+  qn.className = "qualname";
+  qn.textContent = cls ? name : node.qualname;
+  if (cls) { const c = document.createElement("span"); c.className = "cls"; c.textContent = cls + "."; qn.prepend(c); }
+  row.appendChild(qn);
+
+  const args = document.createElement("span");
+  args.className = "args";
+  const allArgs = [...node.args, ...Object.entries(node.kwargs).map(([k, v]) => `${k}=${v}`)];
+  args.textContent = `(${allArgs.join(", ")})`;
+  row.appendChild(args);
+
+  if (node.position) {
+    const pos = document.createElement("span");
+    pos.className = "position-tag";
+    pos.textContent = `@ ${node.position.join(",")}`;
+    row.appendChild(pos);
+  }
+
+  if (node.raiseEvent) {
+    const r = document.createElement("span");
+    r.className = "result err";
+    r.textContent = `✗ ${node.raiseEvent.error_type}: ${node.raiseEvent.error_message}`;
+    row.appendChild(r);
+  } else if (node.returnEvent) {
+    const r = document.createElement("span");
+    r.className = "result";
+    r.textContent = `→ ${node.returnEvent.result}`;
+    row.appendChild(r);
+    const d = document.createElement("span");
+    d.className = "duration";
+    d.textContent = `(${node.returnEvent.duration_ms}ms)`;
+    row.appendChild(d);
+  }
+
+  let frameContainer = null;
+  if (hasFrames) {
+    const badge = document.createElement("button");
+    badge.className = "frame-badge";
+    const frameCount = node.frames.length;
+    badge.textContent = `${frameCount} frames`;
+    badge.onclick = () => {
+      if (widgets.has(node.callId)) {
+        widgets.get(node.callId).el.remove();
+        widgets.delete(node.callId);
+        badge.textContent = `${frameCount} frames`;
+      } else {
+        if (!frameContainer) { frameContainer = document.createElement("div"); wrap.appendChild(frameContainer); }
+        const w = new FrameGridWidget(frameContainer, node.frames);
+        widgets.set(node.callId, w);
+        badge.textContent = `▲ ${frameCount} frames`;
+      }
+    };
+    row.appendChild(badge);
+  }
+
+  wrap.appendChild(row);
+
+  if (hasKids) {
+    const childrenEl = document.createElement("div");
+    childrenEl.className = "children";
+    for (const child of node.children) renderCallNode(child, childrenEl);
+    wrap.appendChild(childrenEl);
+    toggle.onclick = () => {
+      const collapsed = childrenEl.classList.toggle("collapsed");
+      toggle.textContent = collapsed ? "▶" : "▼";
+    };
+  }
+
+  parentEl.appendChild(wrap);
+}
+
+function renderTree() {
+  const container = document.getElementById("call-tree");
+  container.innerHTML = "";
+  widgets.clear();
+  for (const root of TREE.roots) renderCallNode(root, container);
+  document.getElementById("stat-calls").textContent = TREE.callCount;
+  document.getElementById("stat-searches").textContent = TREE.searchCount;
+  document.getElementById("stat-roots").textContent = TREE.roots.length;
+}
+
+function setAllCollapsed(collapsed) {
+  document.querySelectorAll("#call-tree .children").forEach(el => el.classList.toggle("collapsed", collapsed));
+  document.querySelectorAll("#call-tree .toggle:not(.leaf)").forEach(el => { el.textContent = collapsed ? "▶" : "▼"; });
+}
+
+// Filter: a row matches if its own text contains the needle; ancestors of any
+// match stay visible so you can see the path that led there.
+function applyFilter(needle) {
+  const rows = document.querySelectorAll("#call-tree .call");
+  needle = needle.trim().toLowerCase();
+  if (!needle) {
+    rows.forEach(el => el.classList.remove("hidden-by-filter"));
+    return;
+  }
+  // Post-order: mark matches, then propagate "keep" upward through ancestors.
+  const keep = new Set();
+  rows.forEach(el => {
+    const text = el.querySelector(".call-row").innerText.toLowerCase();
+    if (text.includes(needle)) {
+      keep.add(el);
+      let p = el.parentElement;
+      while (p && p.id !== "call-tree") {
+        if (p.classList.contains("call")) keep.add(p);
+        p = p.parentElement;
+      }
+    }
+  });
+  rows.forEach(el => el.classList.toggle("hidden-by-filter", !keep.has(el)));
+}
+
+// ---------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------
+function loadText(text) {
+  const events = parseJsonl(text);
+  TREE = buildCallTree(events);
+  document.getElementById("stat-events").textContent = events.length;
+  document.getElementById("empty-state").style.display = "none";
+  renderTree();
+}
+
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => loadText(reader.result);
+  reader.readAsText(file);
+}
+
+document.getElementById("file-input").addEventListener("change", (e) => {
+  if (e.target.files[0]) loadFile(e.target.files[0]);
+});
+
+const dropZone = document.getElementById("drop-zone");
+["dragenter", "dragover"].forEach(evt =>
+  dropZone.addEventListener(evt, (e) => { e.preventDefault(); dropZone.classList.add("dragover"); }));
+["dragleave", "drop"].forEach(evt =>
+  dropZone.addEventListener(evt, (e) => { e.preventDefault(); dropZone.classList.remove("dragover"); }));
+dropZone.addEventListener("drop", (e) => {
+  const file = e.dataTransfer.files[0];
+  if (file) loadFile(file);
+});
+
+// Auto-load if frame_viewer.py served this page with a companion /data.jsonl
+// (see frame_viewer.py) — silently does nothing if that route 404s, so the
+// page works identically when opened directly as a plain file.
+fetch("/data.jsonl").then(r => {
+  if (r.ok) return r.text();
+  throw new Error("no preloaded data");
+}).then(loadText).catch(() => {});
+
+document.getElementById("btn-expand-all").onclick = () => setAllCollapsed(false);
+document.getElementById("btn-collapse-all").onclick = () => setAllCollapsed(true);
+document.getElementById("btn-legend").onclick = () => document.getElementById("legend-panel").classList.toggle("hidden");
+document.getElementById("filter").addEventListener("input", (e) => applyFilter(e.target.value));
+</script>
+</body>
+</html>
