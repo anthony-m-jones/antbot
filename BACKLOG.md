@@ -322,8 +322,46 @@ carpet-NPC legs once those exist (#5 above).
       STILL OPEN: (a) observe the server REACTION (door opens / ladder relocates) —
       blocked here only because the test characters had drifted onto random floors and
       spawn stuck (needs a clean char to navigate to a ladder); (b) treat an opened
-      door as walkable so the pather routes THROUGH it (we don't parse the door
-      transform yet); (c) the "wanderers avoid / never-prune" side.
+      door as walkable so the pather routes THROUGH it — DONE, see below (2026-07-23);
+      (c) the "wanderers avoid / never-prune" side.
+- [x] **Doors are routable in `find_shared_route`, not just openable reactively (DONE
+      2026-07-23).** Closes (b) above. Previously a door was invisible to the shared-map
+      router: `contribute_tiles` never adds a closed (blocking) tile to `_walkable`, and
+      `report_link` — the only thing that ever populated `_links` — is gated on the USE
+      action actually RELOCATING the bot, which a door never does (it unblocks, it
+      doesn't move you). So `find_shared_route` always routed AROUND a door if any other
+      path existed, and travel() could only cross one by falling through to the slower
+      per-round `_try_use_object` hunt. Fix: `contribute_tiles` now seeds a `door_unlocked`
+      tile as a SELF-link (`_links[tile] = tile`, not in `_step_links`) the instant it's
+      recognised — unlike a ladder/grate, a door's destination is already known (itself),
+      so there's no need to wait for a bot to actually walk up and use it first.
+      `find_shared_route` needed NO changes: a USE-type link source already gets a
+      "walk here, then use it" edge for free (see its existing docstring) as long as it's
+      in `links`, independent of `walkable` membership. Priced at `MIN_GROUND_SPEED` for
+      now (same as a teleport hop) — plausible since opening one may cost no real time if
+      the use-item packet lands before the walk would've, but unproven; see the new TODO
+      below. Also fixed a real bug this surfaced: `travel()`'s post-shortcut check assumed
+      success == relocation, which is true for every OTHER link kind but never for a door
+      — naively `continue`-ing after using one just re-proposed and re-used the SAME door
+      forever (it never advances past it, since opening it doesn't move you and nothing
+      else lets the router "arrive" there). Fixed by taking one on-foot raw step onto/
+      through the door right after using it (mirroring `_perform_traversal`'s new UNBLOCK
+      handling, which optimistically clears the tile locally so that step can succeed) —
+      a door that's actually locked simply rejects the step and falls through to the
+      existing self-heal/prune path, same as any other stalled shortcut. VERIFIED live:
+      full navtest suite 7/7 pass; "Bot can open a door to leave a room" now passes in
+      1.2-1.6s (was going through the slower fallback); both door-adjacent efficiency
+      fixtures (`climb a floor and open a door`, `unconfirmed z-hop crossroads`) rebuilt
+      and hit cold=warm=par (ratio 1.00, 0% over optimal) — the door is no longer a
+      detour, it's on the optimal path. Dropped the persisted `learned_hazards.json`
+      (learned under the old, door-blind interpretation) so real bots start clean; it
+      regenerates on its own.
+- [ ] **Optimize door link cost.** `MIN_GROUND_SPEED` (same as a teleport) is a placeholder
+      guess, not a measurement — a door needs a walk-adjacent + `use_item` round-trip that
+      a teleport doesn't, so it may deserve its own, likely higher, constant. Once there's
+      a navtest that can score real door-hop time against the alternatives, use it to tune
+      a dedicated cost instead of sharing the teleport price (see the TODO in
+      `nav.find_shared_route` next to where `MIN_GROUND_SPEED` is applied).
 - [x] **Inventory parsing (DONE 2026-07-14).** `GameState.inventory` (worn slots
       1-10, from 0x78/0x79) + `GameState.containers` (from 0x6E open + 0x6F/0x70/0x71/
       0x72 updates) + `GameState.carries(*ids)` lookup. The backpack auto-opens at

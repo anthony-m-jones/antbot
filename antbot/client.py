@@ -1650,7 +1650,7 @@ async def _perform_traversal(session: GameSession, source: tuple[int, int, int],
     Returns the Position we ended up at IF the action relocated us (a real shortcut),
     else None. Recording the resulting link is the caller's responsibility.
     """
-    from .traversal import STEP, USE, USE_WITH, TOOL_IDS
+    from .traversal import STEP, USE, USE_WITH, UNBLOCK, TOOL_IDS
 
     reg = session.colony.traversal if session.colony is not None else None
     kind = reg.kind(category) if reg is not None else None
@@ -1719,6 +1719,21 @@ async def _perform_traversal(session: GameSession, source: tuple[int, int, int],
         return None
     if (after.x, after.y, after.z) != (before.x, before.y, before.z):
         return after   # the action relocated us — a shortcut
+
+    if kind.direction == UNBLOCK:
+        # By design this NEVER relocates us (opening a door doesn't move you), so the
+        # relocation check above can't tell success from failure here. Optimistically
+        # treat the object as cleared so whatever walks next (the local walker, or the
+        # shared-route follower after a router-driven `_take_shortcut` hop) can pass
+        # through right away, in case the server's own transform (closed->open) is
+        # still in flight. A still-shut door (locked, no key — USE_WITH above already
+        # skipped without touching the tile) simply re-blocks on the next rejected
+        # step; nothing here claims success that wasn't earned.
+        items = session.state.tiles.get(source)
+        if items:
+            session.state.tiles[source] = [(i, c) for (i, c) in items if i != item_id]
+        session.state.blocked_tiles.discard(source)
+        session.state.blocked_expiry.pop(source, None)
     return None
 
 
@@ -1775,10 +1790,10 @@ async def _reach_and_use(session: GameSession, item_flags: ItemFlags, found,
     We only need to be ADJACENT: `use_item` works from any of the eight surrounding tiles,
     and — crucially for a SHUT door — `find_use_object` can hand back a `launch` on the FAR
     side of the object, which is unreachable through it. So when we're already beside the
-    object we don't chase `launch`. When we open a DOOR (used, no relocation) we also
-    optimistically treat its tile as passable, so the pather routes through it immediately
-    in case the server's transform (closed->open) update is still in flight; a still-shut
-    door simply re-blocks on the next rejected step.
+    object we don't chase `launch`. Opening a DOOR (used, no relocation) optimistically
+    treats its tile as passable — see `_perform_traversal`'s UNBLOCK handling — so the
+    pather routes through it immediately in case the server's transform (closed->open)
+    update is still in flight; a still-shut door simply re-blocks on the next rejected step.
     """
     source, item_id, category, launch, direction = found
 
@@ -1793,14 +1808,7 @@ async def _reach_and_use(session: GameSession, item_flags: ItemFlags, found,
             return None   # couldn't get beside it this lap
 
     session.status = f"using {category}"
-    landing = await _perform_traversal(session, source, direction, category, item_id)
-    if landing is None and category in _DOOR_CATEGORIES:
-        items = session.state.tiles.get(source)
-        if items:
-            session.state.tiles[source] = [(i, c) for (i, c) in items if i != item_id]
-        session.state.blocked_tiles.discard(source)
-        session.state.blocked_expiry.pop(source, None)
-    return landing
+    return await _perform_traversal(session, source, direction, category, item_id)
 
 
 @log_call
@@ -2141,6 +2149,27 @@ async def travel(session: GameSession, item_flags: ItemFlags,
         if after is None:
             return False
         after_t = (after.x, after.y, after.z)
+
+        if source == landing and direction != "__here__":
+            # An UNBLOCK-type link (a door): `source == landing` is exactly how a door's
+            # self-link is recorded (see colony.contribute_tiles), because using it never
+            # relocates anyone the way every other link kind does — so right after
+            # `_take_shortcut`, `after_t` is still just `launch`, one tile short of the
+            # door. Take the on-foot step onto/through it now that `_perform_traversal`
+            # has (optimistically) cleared it locally — otherwise every replan would just
+            # re-open the same already-open door forever, never actually advancing past
+            # it (there's no OTHER route past it: crossing a door is a two-part act, use
+            # it, THEN step, not one atomic hop like a teleport). A door that's actually
+            # still shut (locked, no key) simply rejects this step, and `after_t` below
+            # then falls through to the same self-heal/prune handling as any other
+            # stalled shortcut. (`__here__` is excluded: it means we started standing
+            # exactly ON the door tile, so `after_t` already equals `landing` — nothing
+            # left to walk onto.)
+            await _raw_step(session, cardinal)
+            after = session.state.position
+            if after is None:
+                return False
+            after_t = (after.x, after.y, after.z)
 
         if after_t == landing:
             colony.confirm_link(source, landing)          # trusted from now on

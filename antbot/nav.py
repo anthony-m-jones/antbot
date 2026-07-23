@@ -874,6 +874,13 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
                 # Both branches must be in the SAME units, or the router mis-prices one of
                 # them badly. A teleport is instant, so it costs the cheapest step there is —
                 # never more than walking, or we'd trudge straight past a portal.
+                #
+                # TODO(door cost): a door link (see colony.contribute_tiles' door_unlocked
+                # seeding) is priced the same MIN_GROUND_SPEED as a real teleport for now —
+                # plausible since opening one may cost no in-game time at all if the
+                # use-item packet lands before the walk would've, but unproven. Once a
+                # navtest can score actual door-hop time against alternatives, give doors
+                # their own tunable constant here instead of sharing the teleport price.
                 gamble = not teleport and landing in unconfirmed_crossings
                 if teleport:
                     step = MIN_GROUND_SPEED

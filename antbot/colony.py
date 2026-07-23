@@ -735,6 +735,7 @@ class Colony:
         progress.
         """
         added = 0
+        seeded_door = False
         with self._lock:
             newly_walkable: list[tuple[int, int, int]] = []
             for (x, y, z), items in state.tiles.items():
@@ -760,12 +761,28 @@ class Colony:
                 # one does nothing). If we haven't actually crossed it yet (no `_links`
                 # entry), flag it for the OPTIMISTIC-cost treatment in find_nearest_step_toward/
                 # find_shared_route instead of leaving it priced as ordinary ground.
-                if (x, y, z) not in self._links:
+                if (x, y, z) not in self._links and (x, y, z) not in self._bad_links:
                     hit = self.traversal.classify(ids)
                     if hit is not None:
-                        kind = self.traversal.kind(hit[0])
+                        category, _item_id = hit
+                        kind = self.traversal.kind(category)
                         if kind is not None and kind.action == "step":
                             self._unconfirmed_crossings.add((x, y, z))
+                        elif category == "door_unlocked":
+                            # Unlike a ladder/grate, a door's destination is already known
+                            # the instant we recognise it — using it opens the way rather
+                            # than relocating us, so it's ALWAYS "source -> itself". Seed
+                            # the routable edge on sight instead of waiting for some bot to
+                            # actually walk up and use it (which `report_link` alone would
+                            # require, since it only fires on relocation — a door never
+                            # relocates anyone). find_shared_route's existing USE-type link
+                            # handling (see there) offers this as a "walk here, then use it"
+                            # edge for free; no router changes needed. A door that turns out
+                            # to be LOCKED is pruned the normal way, via mark_bad_link, once
+                            # that correction exists — see traversal.py.
+                            self._links[(x, y, z)] = (x, y, z)
+                            self._hazards.add((x, y, z))
+                            seeded_door = True
                 added += 1
             # Fold the bot's newly-seen slots (delta) into the shared seen set, then
             # refresh only the frontiers that could have changed (cheap, local).
@@ -773,6 +790,8 @@ class Colony:
             self._seen.update(newly_seen)
             state.newly_seen.clear()
             self._refresh_frontiers(newly_walkable, newly_seen)
+            if seeded_door:
+                self._save_knowledge()
         return added
 
     _NEI = ((0, -1), (1, 0), (0, 1), (-1, 0))
