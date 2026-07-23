@@ -1,11 +1,11 @@
-"""Regression test for a specific gap: does the LOCAL walker (`nav.find_path_toward`,
-used by `client._walk_to`) respect a floor-change hazard that the COLONY already knows
+"""Regression test for a specific gap: does the LOCAL walker (`nav.find_nearest_step_toward`,
+used by `client._walk_local`) respect a floor-change hazard that the COLONY already knows
 about globally, even when THIS bot has never personally laid eyes on that exact tile?
 
-Background: `travel()`'s shared router (`nav.find_route`) already gets this right — it
-checks membership in `colony.get_step_unconfirmed()`, a set built from EVERY bot's
+Background: `travel()`'s shared router (`nav.find_shared_route`) already gets this right — it
+checks membership in `colony.get_unconfirmed_crossings()`, a set built from EVERY bot's
 sightings, so a hazard Bot A discovered stays respected when Bot B routes through the
-same area later, even if Bot B never personally saw it. `find_path_toward` did NOT do
+same area later, even if Bot B never personally saw it. `find_nearest_step_toward` did NOT do
 this: its gamble-detection tried to CLASSIFY the tile from `state.tiles` — this bot's
 own private, locally-parsed view — so a tile known only through the colony's shared
 walkable set (reachable via `extra_walkable`, but never personally rendered) silently
@@ -32,9 +32,9 @@ Two assertions, both meaningful permanently (not just today):
      limit of local-only classification; it's expected to keep failing this way forever,
      by design (a bot genuinely blind to a tile can't be expected to reason about it).
 
-  2. WITH global awareness (`step_unconfirmed=colony.get_step_unconfirmed()`, the NEW
+  2. WITH global awareness (`unconfirmed_crossings=colony.get_unconfirmed_crossings()`, the NEW
      parameter this fix adds): the walker no longer heads toward the hazard. It does NOT
-     necessarily find the safe route here — `find_path_toward` is a myopic "walk to
+     necessarily find the safe route here — `find_nearest_step_toward` is a myopic "walk to
      whichever reachable tile is geometrically closest" planner (see its own docstring),
      and the safe tile in this exact layout is actually FARTHER from the goal in raw
      distance than standing still (the real route has to detour away from the goal before
@@ -54,7 +54,7 @@ import sys
 
 from .catalog import load_item_catalog
 from .items import ItemFlags
-from .nav import find_path_toward
+from .nav import find_nearest_step_toward
 from .traversal import TraversalRegistry
 from .world import GameState, Position
 
@@ -113,25 +113,25 @@ def main() -> int:
 
     # --- Reference: what does a bot that HAS personally seen the hazard already do? ---
     # This is the behavior global awareness needs to MATCH (parity), not something new to
-    # invent — `find_path_toward` is a myopic "closest reachable tile" walker (see its own
+    # invent — `find_nearest_step_toward` is a myopic "closest reachable tile" walker (see its own
     # docstring), and the safe tile here is actually farther from the goal in raw distance
     # than standing still (the real route must detour away from the goal first — that's
     # `travel()`'s full-route job). So the honest, correct outcome even WITH full knowledge
     # is "nothing reachable is closer" — not a route through the hazard.
     ref_state = _build_state()
     ref_state.tiles[HAZARD] = [(433, 1)]   # this bot HAS genuinely seen it, for reference
-    ref_path = find_path_toward(ref_state, flags, GOAL_X, GOAL_Y,
+    ref_path = find_nearest_step_toward(ref_state, flags, GOAL_X, GOAL_Y,
                                 extra_walkable=extra_walkable,
                                 registry=registry, confirmed_links=set())
     print(f"  [reference: seen it locally] path = {ref_path!r} "
           f"(the target outcome: correctly refuses to head at the hazard)")
     assert ref_path is None or ref_path[0] != "north", (
-        "premise broken: even WITH local knowledge, find_path_toward heads at the "
+        "premise broken: even WITH local knowledge, find_nearest_step_toward heads at the "
         "hazard — something changed in the local-classification path itself")
 
     # --- Assertion 1: local-only classification is (expectedly, permanently) blind ---
     state1 = _build_state()
-    path1 = find_path_toward(state1, flags, GOAL_X, GOAL_Y,
+    path1 = find_nearest_step_toward(state1, flags, GOAL_X, GOAL_Y,
                              extra_walkable=extra_walkable,
                              registry=registry, confirmed_links=set())
     print(f"  [local-only]  first step = {path1[0] if path1 else None!r} "
@@ -139,26 +139,26 @@ def main() -> int:
     if not path1 or path1[0] != "north":
         failures.append(
             "local-only classification unexpectedly avoided the hazard — either the "
-            "premise changed, or find_path_toward's local behavior was altered")
+            "premise changed, or find_nearest_step_toward's local behavior was altered")
 
     # --- Assertion 2: global awareness should match the reference (seen-it) behavior ---
     state2 = _build_state()
     try:
-        path2 = find_path_toward(state2, flags, GOAL_X, GOAL_Y,
+        path2 = find_nearest_step_toward(state2, flags, GOAL_X, GOAL_Y,
                                  extra_walkable=extra_walkable,
                                  registry=registry, confirmed_links=set(),
-                                 step_unconfirmed={HAZARD})
+                                 unconfirmed_crossings={HAZARD})
     except TypeError as err:
         print(f"  [global-aware] CRASHED: {err}")
-        print("                 (expected before the fix: find_path_toward has no "
-              "step_unconfirmed parameter yet)")
+        print("                 (expected before the fix: find_nearest_step_toward has no "
+              "unconfirmed_crossings parameter yet)")
         failures.append(f"global-aware call not yet supported: {err}")
     else:
         print(f"  [global-aware] path = {path2!r} "
               f"(expected to match the reference — no longer heads at the hazard)")
         if path2 != ref_path:
             failures.append(
-                f"with step_unconfirmed passed, doesn't match the seen-it-locally "
+                f"with unconfirmed_crossings passed, doesn't match the seen-it-locally "
                 f"reference (got {path2!r}, reference was {ref_path!r}) — global "
                 f"awareness isn't behaving like local awareness would")
 

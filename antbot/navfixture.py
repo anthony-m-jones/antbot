@@ -18,7 +18,7 @@ the scene; the colony bots never touch any of this):
      real navigate across the floor-change is also driven, because a stairs/ladder LINK is
      only recorded when the bot actually STEPS through it (GOD-teleporting over it doesn't
      teach the link), and the optimal route needs that edge to cross floors.
-  3. SOLVE for the time-optimal route with navcost.optimal (weighted Dijkstra over the
+  3. SOLVE for the time-optimal route with navcost.compute_par (weighted Dijkstra over the
      revealed graph) and freeze (par_cost, par_path, the region's cost table) to disk.
 
 `load` reads the fixture back for the test harness. The stored cost table is what BOTH the
@@ -62,7 +62,7 @@ class ParFixture:
     par_path: list[Tile]
     costs: dict[Tile, int]      # region ground speeds — the shared table for floor AND score
     # The full revealed graph, so the WARM pass can be handed complete map knowledge without
-    # a preceding cold exploration (see navtests.run_efficiency / Colony.seed_known). walkable
+    # a preceding cold exploration (see navtests.run_efficiency / Colony.seed_for_test). walkable
     # keys == costs keys; links carries the stair/ladder/teleport edges across floors.
     walkable: set[Tile]
     links: dict[Tile, Tile]
@@ -74,7 +74,7 @@ class ParFixture:
 
     def cost_of(self):
         """The `cost_of` callable navcost wants, backed by this fixture's frozen table."""
-        return navcost.cost_lookup(self.costs)
+        return navcost.make_cost_lookup(self.costs)
 
 
 def _slug(name: str) -> str:
@@ -231,13 +231,13 @@ async def build(item_flags: ItemFlags, name: str, start: Tile, dest: Tile,
         # crossed (so it's not in `links`) must be priced the same honest, non-free way the
         # live router prices it — otherwise the solver can route the "optimal" path straight
         # through an object that would really relocate you, freezing a par_cost no bot could
-        # actually achieve. See navcost.optimal's docstring.
-        step_unconfirmed = colony.get_step_unconfirmed()
+        # actually achieve. See navcost.compute_par's docstring.
+        unconfirmed_crossings = colony.get_unconfirmed_crossings()
         # The destination sits behind the (now open) door, so its tile is walkable in the
         # reveal. If it somehow isn't reachable, the reveal was incomplete — surface that
         # rather than freezing a bogus floor.
-        solved = navcost.optimal(walkable, links, costs, start, dest,
-                                 step_unconfirmed=step_unconfirmed)
+        solved = navcost.compute_par(walkable, links, costs, start, dest,
+                                     unconfirmed_crossings=unconfirmed_crossings)
         if solved is None:
             result["error"] = (
                 f"could not solve an optimal route {start} -> {dest} over the revealed "

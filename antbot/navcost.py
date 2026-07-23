@@ -4,7 +4,7 @@ The navigation efficiency tests (see navtests.py) don't ask "did the bot arrive?
 pass/fail suite already does. They ask "how CLOSE to the fastest possible route did it
 get?". Answering that needs two numbers in the SAME units:
 
-  * the FLOOR — the cost of the time-optimal route over a fully-revealed map (`optimal`),
+  * the FLOOR — the cost of the time-optimal route over a fully-revealed map (`compute_par`),
   * the SCORE — the cost of the route the bot actually walked (`route_cost`),
 
 and the whole point collapses if those two are computed even slightly differently. So both
@@ -33,7 +33,7 @@ the bot can actually perform, which keeps the optimum genuinely reachable — a 
 converge on ratio ~1.0. If we ever teach the bot diagonal steps, the diagonal-time factor
 belongs here, in `_step_cost`, so floor and score pick it up together.
 
-FLOOR-CHANGES AND DOORS. A stairs/ladder/teleport hop is priced like `find_route` prices
+FLOOR-CHANGES AND DOORS. A stairs/ladder/teleport hop is priced like `find_shared_route` prices
 it — the cheapest step there is (LINK_HOP_COST) — because it's effectively instant and must
 never look costlier than walking, or the floor would trudge past a shortcut. A door adds no
 node of its own: the optimal map is revealed with the door OPEN, so its tile is just a
@@ -46,12 +46,12 @@ from __future__ import annotations
 
 from typing import Callable, Iterable, Mapping, Sequence
 
-from .nav import DEFAULT_GROUND_SPEED, MIN_GROUND_SPEED, find_route
+from .nav import DEFAULT_GROUND_SPEED, MIN_GROUND_SPEED, find_shared_route
 
 Tile = tuple[int, int, int]
 
 # A floor-change / teleport hop costs the cheapest a step can ever be — identical to how
-# nav.find_route prices a link edge, so the floor and the score agree with the router that
+# nav.find_shared_route prices a link edge, so the floor and the score agree with the router that
 # a shortcut is effectively free. Anything higher would make the model fear its own stairs.
 LINK_HOP_COST = MIN_GROUND_SPEED
 
@@ -81,7 +81,7 @@ def _step_cost(prev: Tile, cur: Tile, cost_of: Callable[[Tile], int]) -> int:
     return cost_of(cur)
 
 
-def cost_lookup(costs: Mapping[Tile, int]) -> Callable[[Tile], int]:
+def make_cost_lookup(costs: Mapping[Tile, int]) -> Callable[[Tile], int]:
     """Turn a {tile -> ground speed} table into the `cost_of` callable route_cost wants.
 
     Unpriced tiles fall back to DEFAULT_GROUND_SPEED — the same pessimistic stand-in the
@@ -118,12 +118,12 @@ def route_cost(path: Sequence[Tile], cost_of: Callable[[Tile], int]) -> int:
     return total
 
 
-def optimal(walkable: set[Tile], links: dict[Tile, Tile], costs: Mapping[Tile, int],
+def compute_par(walkable: set[Tile], links: dict[Tile, Tile], costs: Mapping[Tile, int],
             start: Tile, dest: Tile, reach: int = 0,
-            step_unconfirmed: set[Tile] | None = None) -> tuple[int, list[Tile]] | None:
+            unconfirmed_crossings: set[Tile] | None = None) -> tuple[int, list[Tile]] | None:
     """The time-optimal route from `start` to `dest` over a fully-revealed map — the FLOOR.
 
-    Delegates the search to nav.find_route (weighted Dijkstra over the shared walkable graph
+    Delegates the search to nav.find_shared_route (weighted Dijkstra over the shared walkable graph
     plus learned stair/teleport links, priced by `costs`), then re-prices the resulting tile
     path through `route_cost` — the SAME accounting the bot's actual route is scored with, so
     floor and score are guaranteed commensurable. Returns (cost, [start, ...dest]) or None if
@@ -131,30 +131,30 @@ def optimal(walkable: set[Tile], links: dict[Tile, Tile], costs: Mapping[Tile, i
     incomplete — not that the bot failed).
 
     The map must be revealed with any blocking-but-openable obstacle (a door) already OPEN,
-    so `walkable` includes its tile; find_route then routes through it like any other ground
+    so `walkable` includes its tile; find_shared_route then routes through it like any other ground
     and both floor and score pay its ground cost. See the module docstring.
 
-    `step_unconfirmed` (pass `colony.get_step_unconfirmed()` from the SAME reveal) matters
+    `unconfirmed_crossings` (pass `colony.get_unconfirmed_crossings()` from the SAME reveal) matters
     whenever the revealed region contains a STEP-type floor-change (a hole/stairs/teleporter)
     that was only ever SEEN during the reveal, never actually crossed into a confirmed link.
-    Without this, find_route has no idea that tile isn't ordinary ground and can route the
+    Without this, find_shared_route has no idea that tile isn't ordinary ground and can route the
     "optimal" path straight through it — reporting a floor that isn't actually achievable,
     since in reality stepping there relocates you somewhere the solver never accounted for.
     Passing it makes the floor solved with the EXACT same honesty the live router uses (see
-    nav.unconfirmed_step_cost): a route that avoids the object wins if it's genuinely cheaper,
+    nav.unconfirmed_crossing_cost): a route that avoids the object wins if it's genuinely cheaper,
     but the object is never silently treated as free passage. This was a real bug — a test
     region with such an object froze a par_cost lower than any bot (cold OR warm) could
     actually achieve, since both correctly refuse to gamble through it. Omitting this
     (the old behavior) is only correct for a region with no such loose ends.
     """
-    route = find_route(walkable, links, start, dest, reach=reach, costs=dict(costs),
-                       step_unconfirmed=step_unconfirmed)
+    route = find_shared_route(walkable, links, start, dest, reach=reach, costs=dict(costs),
+                               unconfirmed_crossings=unconfirmed_crossings)
     if route is None:
         return None
-    # find_route yields (direction, is_teleport, landing) per step; the tiles we STAND on
+    # find_shared_route yields (direction, is_teleport, landing) per step; the tiles we STAND on
     # are start followed by each landing. Price that exact sequence with route_cost.
     path: list[Tile] = [start] + [landing for _dir, _tp, landing in route]
-    return route_cost(path, cost_lookup(costs)), path
+    return route_cost(path, make_cost_lookup(costs)), path
 
 
 def as_tiles(positions: Iterable) -> list[Tile]:

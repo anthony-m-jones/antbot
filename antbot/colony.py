@@ -167,8 +167,8 @@ class BotView:
     # dashboard draws both so that difference is visible at a glance.
     goal: tuple[int, int, int] | None = None
     plan: list = dataclasses.field(default_factory=list)
-    # Which pathfinder set `plan` (or last failed): "shared" (find_route over the colony
-    # map) or "local" (find_path_toward over the bot's own view). Lets the dashboard name
+    # Which pathfinder set `plan` (or last failed): "shared" (find_shared_route over the colony
+    # map) or "local" (find_nearest_step_toward over the bot's own view). Lets the dashboard name
     # WHICH planner is responsible for a bot's current move or its no-route state.
     plan_source: str = ""
     # Debug overlay inputs (only meaningful for the focused bot). `blocked` is this
@@ -236,7 +236,7 @@ class Colony:
         # (x, y, z) -> minimap colour index (0-215). One entry per explored tile.
         self._explored: dict[tuple[int, int, int], int] = {}
         # (x, y, z) tiles that are walkable (ground, no blocking item). This is the
-        # shared graph the world-wide route finder walks over (see nav.find_route),
+        # shared graph the world-wide route finder walks over (see nav.find_shared_route),
         # so a bot can route across regions/floors using everyone's exploration.
         self._walkable: set[tuple[int, int, int]] = set()
         # tile -> what it costs to cross (Tibia groundSpeed; bigger = slower). Filled in
@@ -271,12 +271,12 @@ class Colony:
         # STEP-type floor-changes (a hole/open-stairs/teleporter — walking onto it
         # relocates you instantly, unlike a ladder's deliberate "use") that some bot has
         # SEEN but nobody has actually crossed yet, so there's no `_links` entry for them.
-        # `find_path_toward`/`find_route` price a tile in this set at
-        # `nav.unconfirmed_step_cost` — an honest, optimistic lower bound — instead of its
+        # `find_nearest_step_toward`/`find_shared_route` price a tile in this set at
+        # `nav.unconfirmed_crossing_cost` — an honest, optimistic lower bound — instead of its
         # ordinary ground cost, so a route that avoids it wins when a cheaper one exists,
         # but crossing it is never forbidden outright. The moment a tile here is actually
         # crossed it becomes a real `_links` entry and is removed — see report_link.
-        self._step_unconfirmed: set[tuple[int, int, int]] = set()
+        self._unconfirmed_crossings: set[tuple[int, int, int]] = set()
         # Learned item-id -> object category (teleporter/stairs/...), so the colony
         # can recognise shortcut objects on sight. Shared by all bots. We seed it
         # from Canary's items.xml (ground truth: names + floorchange/type keyed by
@@ -737,14 +737,14 @@ class Colony:
                 # A recognized STEP-type object (walking onto it relocates you — a
                 # ladder is USE-type and safe to ignore here, since merely walking near
                 # one does nothing). If we haven't actually crossed it yet (no `_links`
-                # entry), flag it for the OPTIMISTIC-cost treatment in find_path_toward/
-                # find_route instead of leaving it priced as ordinary ground.
+                # entry), flag it for the OPTIMISTIC-cost treatment in find_nearest_step_toward/
+                # find_shared_route instead of leaving it priced as ordinary ground.
                 if (x, y, z) not in self._links:
                     hit = self.traversal.classify(ids)
                     if hit is not None:
                         kind = self.traversal.kind(hit[0])
                         if kind is not None and kind.action == "step":
-                            self._step_unconfirmed.add((x, y, z))
+                            self._unconfirmed_crossings.add((x, y, z))
                 added += 1
             # Fold the bot's newly-seen slots (delta) into the shared seen set, then
             # refresh only the frontiers that could have changed (cheap, local).
@@ -824,10 +824,10 @@ class Colony:
         BFS distance (fewest hops) is a fine proxy for "nearest".
 
         `avoid` MUST be the same exclusion set the router will use (see `travel`). This
-        flood is the SELECTOR and `find_route` is the EXECUTOR: if the selector is more
+        flood is the SELECTOR and `find_shared_route` is the EXECUTOR: if the selector is more
         permissive, it hands out targets the router cannot reach, the trip fails, nothing
         feeds back, and the bot is offered the identical frontier next round — an infinite
-        loop. So the edge rules below mirror `find_route` exactly: reject an avoided tile
+        loop. So the edge rules below mirror `find_shared_route` exactly: reject an avoided tile
         BEFORE consulting the links table, take links ahead of plain walkable, and reject
         an avoided landing. Callers pass hazards+blocked MINUS the links they intend to
         traverse, exactly as `travel` does.
@@ -863,7 +863,7 @@ class Colony:
             cx, cy, cz = cur
             for dx, dy in self._NEI:
                 nb = (cx + dx, cy + dy, cz)
-                # Mirror find_route's edges EXACTLY (see the docstring on `avoid`):
+                # Mirror find_shared_route's edges EXACTLY (see the docstring on `avoid`):
                 # avoided tile rejected first, then links ahead of plain walkable —
                 # stepping onto a link-source tile whisks you to its destination (that's
                 # how a ladder/hole/teleport is traversed — the source itself often isn't
@@ -897,7 +897,7 @@ class Colony:
             changed = source not in self._hazards or self._links.get(source) != dest
             self._hazards.add(source)
             self._links[source] = dest
-            self._step_unconfirmed.discard(source)  # now a real link, not a gamble
+            self._unconfirmed_crossings.discard(source)  # now a real link, not a gamble
             if changed:
                 self._save_knowledge()
 
@@ -911,7 +911,7 @@ class Colony:
             if self._links.get(source) != dest:
                 self._links[source] = dest
                 self._save_knowledge()
-            self._step_unconfirmed.discard(source)
+            self._unconfirmed_crossings.discard(source)
 
     def mark_bad_link(self, source: tuple[int, int, int]) -> None:
         """Travel stepped on `source` and it did NOT relocate us — prune it.
@@ -924,13 +924,13 @@ class Colony:
             self._links.pop(source, None)
             self._save_knowledge()
 
-    def get_step_unconfirmed(self) -> set[tuple[int, int, int]]:
+    def get_unconfirmed_crossings(self) -> set[tuple[int, int, int]]:
         """A copy of the STEP-type floor-changes seen but never crossed — feed to
-        `nav.find_path_toward`/`nav.find_route` so they price a gamble on one honestly
+        `nav.find_nearest_step_toward`/`nav.find_shared_route` so they price a gamble on one honestly
         instead of either ordinary ground cost (the original bug) or a hard block (which
         fragments a staircase-dense map)."""
         with self._lock:
-            return set(self._step_unconfirmed)
+            return set(self._unconfirmed_crossings)
 
     def get_hazards(self) -> set[tuple[int, int, int]]:
         """A copy of all known hazard tiles, for a bot to fold into its avoid set."""
@@ -950,7 +950,7 @@ class Colony:
     def walkable_ref(self) -> set[tuple[int, int, int]]:
         """The live shared walkable set, returned BY REFERENCE (no copy).
 
-        For `find_path_toward`, which the scout re-runs every single step: copying the
+        For `find_nearest_step_toward`, which the scout re-runs every single step: copying the
         whole ~15k-tile set each time (as `get_walkable` does) would tax us hard at
         scale, and the planner only ever does O(1) membership tests against it. Safe for
         the same reason as `shared_seen`: `_walkable` is mutated only in
@@ -965,9 +965,9 @@ class Colony:
         with self._lock:
             return dict(self._walk_cost)
 
-    def seed_known(self, walk_costs: dict[tuple[int, int, int], int],
-                   links: dict[tuple[int, int, int], tuple[int, int, int]],
-                   tiles: dict[tuple[int, int, int], list] | None = None) -> None:
+    def seed_for_test(self, walk_costs: dict[tuple[int, int, int], int],
+                      links: dict[tuple[int, int, int], tuple[int, int, int]],
+                      tiles: dict[tuple[int, int, int], list] | None = None) -> None:
         """Inject pre-known map knowledge directly, as if bots had already explored it.
 
         This is TEST tooling for the efficiency harness's WARM pass (see
@@ -981,7 +981,7 @@ class Colony:
         colony that a cold pass already populated simply tops it up to the full reveal.
 
         `tiles` (pass `fixture.tiles` — raw item stacks) lets this ALSO populate
-        `_step_unconfirmed`, mirroring `contribute_tiles`'s own classification exactly.
+        `_unconfirmed_crossings`, mirroring `contribute_tiles`'s own classification exactly.
         Without this, "full knowledge" silently meant "knows every tile is walkable" but
         NOT "has noticed which of those tiles are recognized-but-uncrossed floor-changes"
         — so a warm bot would walk straight into one as if it were plain ground, the exact
@@ -1009,7 +1009,7 @@ class Colony:
                     if hit is not None:
                         kind = self.traversal.kind(hit[0])
                         if kind is not None and kind.action == "step":
-                            self._step_unconfirmed.add(tile)
+                            self._unconfirmed_crossings.add(tile)
 
     def register_session(self, name: str, session) -> None:
         """Bind a live bot session by name, for the dashboard's packet inspector."""
@@ -1040,10 +1040,10 @@ class Colony:
         real ground speeds, and gold is 0 until boat/carpet NPC travel exists (the
         route can't yet include those legs).
         """
-        from .nav import find_route
+        from .nav import find_shared_route
         start, goal = tuple(start), tuple(goal)
         costs = self.get_walk_costs()
-        route = find_route(self.get_walkable(), self.get_links(), start, goal,
+        route = find_shared_route(self.get_walkable(), self.get_links(), start, goal,
                            costs=costs)
         if route is None:
             with self._lock:
@@ -1159,8 +1159,8 @@ class Colony:
                  "goal": list(b.goal) if b.goal else None,
                  "plan": [list(t) for t in b.plan],
                  "stuck": b.stuck,
-                 # Which pathfinder is steering: "shared" (find_route) or "local"
-                 # (find_path_toward). Lets the UI show which path is causing trouble.
+                 # Which pathfinder is steering: "shared" (find_shared_route) or "local"
+                 # (find_nearest_step_toward). Lets the UI show which path is causing trouble.
                  "plan_source": b.plan_source,
                  # Creature-tracking health (move_misses / ghosts) — see BotView.tracking.
                  "tracking": b.tracking,
@@ -1215,7 +1215,7 @@ class Colony:
           hazard      — a known teleport / floor-change source the swarm avoids. Shared,
                         no expiry.
           unreachable — loot tiles written off as uncollectable. Persisted.
-          occupied    — a creature is standing there right now. `find_path_toward` won't
+          occupied    — a creature is standing there right now. `find_nearest_step_toward` won't
                         route through these; `find_frontier` ignores them — which is one
                         way a frontier looks reachable but the walker can't get there.
 

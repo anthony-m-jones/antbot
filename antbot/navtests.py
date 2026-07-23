@@ -167,8 +167,8 @@ TESTS: list[NavTest] = [
         cold_budget=None,
         warm_budget=None,
     ),
-    # ISOLATION CASE for the unconfirmed-z-hop routing question (see nav.unconfirmed_step_cost
-    # / colony._step_unconfirmed). Start already at the ladder's OWN landing tile on z7 — same
+    # ISOLATION CASE for the unconfirmed-z-hop routing question (see nav.unconfirmed_crossing_cost
+    # / colony._unconfirmed_crossings). Start already at the ladder's OWN landing tile on z7 — same
     # floor as the goal, so no floor-change is required at all — but this tile is a genuine
     # crossroads: several recognized-but-uncrossed STEP-type objects (multiple stairs_down,
     # a teleporter) sit within a couple of tiles, plus the ladder itself back down. A cold
@@ -512,7 +512,7 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
         # (below): the local walker then stops at the door rather than trying to step through a
         # tile it wrongly believes is open, and navigate_to's open-the-door branch engages.
         if phase == "warm":
-            colony.seed_known(fixture.costs, fixture.links, fixture.tiles)
+            colony.seed_for_test(fixture.costs, fixture.links, fixture.tiles)
         session = await gm.connect_retry(flags, ACCOUNT, PASSWORD, CHARACTER,
                                          host=HOST, login_port=LOGIN_PORT)
         session.colony = colony

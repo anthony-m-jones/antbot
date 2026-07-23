@@ -70,7 +70,7 @@ def _packet_decode(sess, seq: int) -> dict:
 
 def _route_query(colony: Colony, qs: dict) -> dict:
     """Plan a teleport-aware route from the lead bot to a queried tile."""
-    from .nav import find_route
+    from .nav import find_shared_route
     try:
         gx = int(qs["x"][0]); gy = int(qs["y"][0]); gz = int(qs.get("z", ["7"])[0])
     except (KeyError, ValueError):
@@ -80,7 +80,7 @@ def _route_query(colony: Colony, qs: dict) -> dict:
         return {"error": "no bots online to route from"}
     lead = snap["bots"][0]
     start = (lead["x"], lead["y"], lead["z"])
-    route = find_route(colony.get_walkable(), colony.get_links(), start, (gx, gy, gz))
+    route = find_shared_route(colony.get_walkable(), colony.get_links(), start, (gx, gy, gz))
     if route is None:
         return {"start": start, "goal": [gx, gy, gz], "found": False,
                 "known_links": len(colony.get_links())}

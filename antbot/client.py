@@ -243,8 +243,8 @@ class GameSession:
         # instead of every round — see that function.
         self.attack_target: int | None = None
         # Which planner produced the current `plan` (or last failed to): "shared" =
-        # find_route over the colony map (travel/_walk_shared), "local" = the myopic
-        # find_path_toward over this bot's own view (_walk_to). Surfaced on the dashboard
+        # find_shared_route over the colony map (travel/_follow_shared_route), "local" = the myopic
+        # find_nearest_step_toward over this bot's own view (_walk_local). Surfaced on the dashboard
         # so a stuck bot tells us WHICH pathfinder is at fault, not just that it's stuck.
         self.plan_source: str = ""
         # Pickup tiles THIS bot has failed to walk to -> when to forgive them
@@ -356,7 +356,7 @@ class GameSession:
         blocked = [(x, y, z, round(s.blocked_expiry.get((x, y, z), 0) - now, 1))
                    for (x, y, z) in s.blocked_tiles]
         # Creatures we can currently see, for the map's creature layer AND the block
-        # inspector's "occupied" category (find_path_toward avoids these; find_frontier
+        # inspector's "occupied" category (find_nearest_step_toward avoids these; find_frontier
         # doesn't). state.creatures is already pruned to the viewport, so these are live,
         # not stale memory. id + kind let the dashboard colour monster/npc/player apart
         # and dedupe when two bots see the same creature.
@@ -857,7 +857,7 @@ async def path_session(host: str, login_port: int, account: str, password: str,
     Prints the plan; does not walk it yet (that's B2). The point is to prove the
     walkability model and pathfinder against the real parsed map.
     """
-    from .nav import find_path, render_ascii
+    from .nav import find_path_on_floor, render_ascii
 
     session = await _connect_session(host, login_port, account, password,
                                      character_name, item_flags, rsa_n, dump_frames)
@@ -865,7 +865,7 @@ async def path_session(host: str, login_port: int, account: str, password: str,
     async def action(session: GameSession) -> None:
         await asyncio.sleep(0.2)  # let the snapshot finish parsing
         start = session.state.position
-        path = find_path(session.state, item_flags, goal_x, goal_y)
+        path = find_path_on_floor(session.state, item_flags, goal_x, goal_y)
         if path is None:
             log.info("NO PATH from %s to (%d, %d) within the known map",
                      start, goal_x, goal_y)
@@ -918,7 +918,7 @@ def _prune_blocked_tiles(session: GameSession) -> None:
 
 # How far the per-step planner floods when re-planning during exploration. We
 # re-plan every step and only walk its first move, so a local view is plenty; this
-# caps per-step planning cost so many bots can run at once (see find_path_toward's
+# caps per-step planning cost so many bots can run at once (see find_nearest_step_toward's
 # `max_radius`). Comfortably larger than the wanderer's home radius so it can still
 # route around walls. goto/travel pass None instead (exact long-distance routing).
 _PLAN_RADIUS = 40
@@ -960,10 +960,10 @@ _SCOUT_NAV_BUDGET = 8.0
 # Consecutive `navigate_to` rounds with NO net movement before it considers the block
 # might be a MONSTER (or a stale crowd) worth fighting/stepping through rather than just
 # re-planning around forever. A monster occupies its tile transiently (never durably
-# blocked — see _walk_to's "rejected" handling), so a corridor with one rat in it can
+# blocked — see _walk_local's "rejected" handling), so a corridor with one rat in it can
 # otherwise make navigate_to spin indefinitely: replan, get rejected, replan, forever.
 # Set low relative to scout's own 8-round threshold because one navigate_to round is
-# already a full _walk_to attempt (up to 60 steps) or a travel() hop — several of those
+# already a full _walk_local attempt (up to 60 steps) or a travel() hop — several of those
 # producing zero progress is a much stronger "genuinely blocked" signal than one scout tick.
 _NAV_FIGHT_THRESHOLD = 3
 
@@ -1104,9 +1104,9 @@ async def _autowalk_run(session: GameSession, chunk: list[str], start):
     return ("done", done, session.state.position)
 
 
-async def _walk_to(session: GameSession, item_flags: ItemFlags,
-                   goal_x: int, goal_y: int, max_steps: int = 300,
-                   plan_radius: int | None = None, log_stuck: bool = True) -> bool:
+async def _walk_local(session: GameSession, item_flags: ItemFlags,
+                      goal_x: int, goal_y: int, max_steps: int = 300,
+                      plan_radius: int | None = None, log_stuck: bool = True) -> bool:
     """Walk the character to (goal_x, goal_y), following the path via chunked
     auto-walk and re-planning after each chunk (or the moment a step misbehaves).
 
@@ -1117,7 +1117,7 @@ async def _walk_to(session: GameSession, item_flags: ItemFlags,
     the change that keeps us under Canary's flood cutoff. Same-floor goals (B2/B3).
 
     `plan_radius` bounds each re-plan's flood to a local box (see
-    `find_path_toward`); the frequent explorer/scout callers pass `_PLAN_RADIUS` so
+    `find_nearest_step_toward`); the frequent explorer/scout callers pass `_PLAN_RADIUS` so
     per-step planning stays cheap with many bots. `goto`/`travel` leave it None for
     exact long-distance routing.
 
@@ -1127,7 +1127,7 @@ async def _walk_to(session: GameSession, item_flags: ItemFlags,
     milling fallback) pass False, since not arriving at a random point is expected
     and shouldn't spam the issue log.
     """
-    from .nav import find_path_toward
+    from .nav import find_nearest_step_toward
 
     # Remember how far we started from the goal so we can tell, at the end, whether
     # running out of `max_steps` meant "genuinely impeded" (worth logging as an
@@ -1155,19 +1155,19 @@ async def _walk_to(session: GameSession, item_flags: ItemFlags,
         # chunk scrolls more map in, so the next plan reaches further (B3). We hand it
         # the colony's shared walkable set too, so the flood can cross ground a teammate
         # mapped (or that we saw before relogging) instead of dead-ending on our private
-        # view — see find_path_toward's `extra_walkable`.
+        # view — see find_nearest_step_toward's `extra_walkable`.
         shared = session.colony.walkable_ref() if session.colony is not None else None
         registry = session.colony.traversal if session.colony is not None else None
         known_links = set(session.colony.get_links()) if session.colony is not None else None
-        # colony.get_step_unconfirmed() is GLOBAL — built from every bot's sightings, not
+        # colony.get_unconfirmed_crossings() is GLOBAL — built from every bot's sightings, not
         # just ours — so this catches a hazard another bot discovered even if this session
-        # has never personally seen that exact tile (see nav.find_path_toward's docstring).
-        colony_hazards = (session.colony.get_step_unconfirmed()
+        # has never personally seen that exact tile (see nav.find_nearest_step_toward's docstring).
+        colony_hazards = (session.colony.get_unconfirmed_crossings()
                          if session.colony is not None else None)
-        path = find_path_toward(session.state, item_flags, goal_x, goal_y,
+        path = find_nearest_step_toward(session.state, item_flags, goal_x, goal_y,
                                 max_radius=plan_radius, extra_walkable=shared,
                                 registry=registry, confirmed_links=known_links,
-                                step_unconfirmed=colony_hazards)
+                                unconfirmed_crossings=colony_hazards)
         # Publish the intent BEFORE acting on it, so a bot that can't plan still shows
         # the dashboard what it was reaching for. That "goal set, plan empty" state is
         # precisely what an outside observer sees as a frozen bot. `plan_source` records
@@ -1281,14 +1281,14 @@ def _path_tiles(start, directions: list[str]) -> list[tuple[int, int, int]]:
     return tiles
 
 
-async def _walk_shared(session: GameSession, item_flags: ItemFlags,
-                       goal_x: int, goal_y: int, goal_z: int, reach: int = 0,
-                       max_steps: int = 400) -> bool:
+async def _follow_shared_route(session: GameSession, item_flags: ItemFlags,
+                               goal_x: int, goal_y: int, goal_z: int, reach: int = 0,
+                               max_steps: int = 400) -> bool:
     """Walk to (or within `reach` of) a goal by following a route planned over the
     COLONY's shared explored map. Returns True if we arrived.
 
-    This exists because `_walk_to` is MYOPIC, and that is the single biggest reason
-    bots fail to get anywhere. `_walk_to` floods `state.tiles` — only what THIS bot has
+    This exists because `_walk_local` is MYOPIC, and that is the single biggest reason
+    bots fail to get anywhere. `_walk_local` floods `state.tiles` — only what THIS bot has
     personally seen this session — and then greedily heads for the reachable tile
     nearest the goal. Two failure modes follow, and both were biting us hard:
 
@@ -1301,9 +1301,9 @@ async def _walk_shared(session: GameSession, item_flags: ItemFlags,
          does.
 
     The colony already knows the whole town — every bot pours its tiles into the shared
-    map — and `find_route` already does a proper Dijkstra over it. That knowledge was
+    map — and `find_shared_route` already does a proper Dijkstra over it. That knowledge was
     just never used for walking: `travel` planned a real route and then threw it away,
-    handing the on-foot legs back to `_walk_to`. So we re-derived a blind local guess
+    handing the on-foot legs back to `_walk_local`. So we re-derived a blind local guess
     from a private map when a correct global route was already in hand.
 
     Here we follow the actual route: take its directions, hand them to the server in
@@ -1312,12 +1312,12 @@ async def _walk_shared(session: GameSession, item_flags: ItemFlags,
     `avoid`, so the shared map — which only ever grows and never marks a tile bad —
     can't keep routing us into the same wall.
 
-    Scouts still want `_walk_to`: heading into UNEXPLORED space is exactly what the
+    Scouts still want `_walk_local`: heading into UNEXPLORED space is exactly what the
     shared map can't help with, and greedy-toward-the-goal is the right instinct there.
     So this returns False when there's no colony or no known route, and callers fall
     back. Known destination -> route it; unknown frontier -> feel your way.
     """
-    from .nav import find_route, within_reach
+    from .nav import find_shared_route, within_reach
 
     colony = session.colony
     if colony is None:
@@ -1337,7 +1337,7 @@ async def _walk_shared(session: GameSession, item_flags: ItemFlags,
         # owns shortcut traversal, because stepping onto a teleport needs a raw step
         # and a re-plan afterwards. Passing links here would produce a route whose
         # directions we'd then walk straight into a stairwell.
-        # Hit back while we walk — same reason as in `_walk_to`: this loop is where the
+        # Hit back while we walk — same reason as in `_walk_local`: this loop is where the
         # time goes, so self-defence has to live here too, not only in the scout round.
         await _engage_adjacent(session)
 
@@ -1345,12 +1345,12 @@ async def _walk_shared(session: GameSession, item_flags: ItemFlags,
         # doesn't leave a permanent phantom wall in the route planner.
         _prune_blocked_tiles(session)
         avoid = colony.get_hazards() | set(session.state.blocked_tiles)
-        route = find_route(colony.get_walkable(), {}, here, goal, reach=reach,
+        route = find_shared_route(colony.get_walkable(), {}, here, goal, reach=reach,
                            avoid=avoid, costs=colony.get_walk_costs(),
-                           step_unconfirmed=colony.get_step_unconfirmed())
+                           unconfirmed_crossings=colony.get_unconfirmed_crossings())
         session.goal = goal
         session.plan = [landing for _dir, _tp, landing in route] if route else []
-        session.plan_source = "shared"   # find_route over the colony map
+        session.plan_source = "shared"   # find_shared_route over the colony map
         if not route:
             # Either we're there (handled above) or the shared map doesn't connect us.
             session._report_to_colony()
@@ -1402,7 +1402,7 @@ async def _walk_shared(session: GameSession, item_flags: ItemFlags,
 async def _raw_step(session: GameSession, direction: str, timeout: float = 3.0) -> bool:
     """Send one walk step and wait for the outcome, WITHOUT any avoidance.
 
-    Unlike `_walk_to` (which plans around hazards), this steps exactly where told —
+    Unlike `_walk_local` (which plans around hazards), this steps exactly where told —
     used by `travel` to deliberately walk onto a stair/teleport tile to traverse a
     shortcut. Returns True if we moved (or teleported), False on reject/timeout.
     """
@@ -1762,7 +1762,7 @@ async def _reach_and_use(session: GameSession, item_flags: ItemFlags, found,
                 and max(abs(p.x - source[0]), abs(p.y - source[1])) == 1)
 
     if not beside(session.state.position):
-        await _walk_to(session, item_flags, launch[0], launch[1],
+        await _walk_local(session, item_flags, launch[0], launch[1],
                        max_steps=max_steps, plan_radius=_PLAN_RADIUS)
         if not beside(session.state.position):
             return None   # couldn't get beside it this lap
@@ -1819,9 +1819,9 @@ async def _try_use_object(session: GameSession, item_flags: ItemFlags,
     return True
 
 
-async def _try_descend(session: GameSession, item_flags: ItemFlags,
-                       tried: dict,
-                       max_dist: int | None = None, direction: str = "down") -> bool:
+async def _try_change_floor(session: GameSession, item_flags: ItemFlags,
+                            tried: dict,
+                            max_dist: int | None = None, direction: str = "down") -> bool:
     """Scout helper: find a nearby STEP floor-change in `direction` and take it.
 
     The counterpart to `_try_use_object` for the STEP floor-changes it skips, closing two
@@ -1858,7 +1858,7 @@ async def _try_descend(session: GameSession, item_flags: ItemFlags,
         source, item_id, category, launch, direction = found
         tried[source] = now + _TRIED_TTL   # attempted — hold off, but retry after the TTL
         if (pos.x, pos.y) != (launch[0], launch[1]):
-            await _walk_to(session, item_flags, launch[0], launch[1],
+            await _walk_local(session, item_flags, launch[0], launch[1],
                            max_steps=40, plan_radius=_PLAN_RADIUS)
             pos = session.state.position
             if pos is None or (pos.x, pos.y) != (launch[0], launch[1]):
@@ -1912,10 +1912,10 @@ async def travel(session: GameSession, item_flags: ItemFlags,
                  reach: int = 0) -> bool:
     """Travel to (goal_x, goal_y, goal_z) across the whole world, using shortcuts.
 
-    Plans a route with `find_route` over the colony's shared walkable map + learned
+    Plans a route with `find_shared_route` over the colony's shared walkable map + learned
     links (stairs/holes/teleports), then executes it hop by hop:
-      - on-foot stretches are walked with `_walk_shared`, which FOLLOWS the shared
-        route (falling back to `_walk_to`'s local feel-your-way only when the shared
+      - on-foot stretches are walked with `_follow_shared_route`, which FOLLOWS the shared
+        route (falling back to `_walk_local`'s local feel-your-way only when the shared
         map can't connect us — e.g. the last stretch into somewhere nobody's been),
       - a shortcut hop is traversed by stepping onto the source tile, which the
         normal walker avoids — so we do it with a raw step and confirm we landed
@@ -1927,7 +1927,7 @@ async def travel(session: GameSession, item_flags: ItemFlags,
     `reach` accepts arrival within that many tiles — for walking up to an OBJECT
     (a locker, a pile under a blocking item) rather than onto a tile.
     """
-    from .nav import find_route, within_reach
+    from .nav import find_shared_route, within_reach
 
     colony = session.colony
     if colony is None:
@@ -1946,7 +1946,7 @@ async def travel(session: GameSession, item_flags: ItemFlags,
 
         # "A teleport is a hazard to a wanderer but a highway to a traveller" — and this
         # is the router that's supposed to drive the highway. But `report_link` files every
-        # link SOURCE into the hazard set, and `find_route` rejects an avoided tile BEFORE
+        # link SOURCE into the hazard set, and `find_shared_route` rejects an avoided tile BEFORE
         # it consults the links table, so handing it the raw hazards made it unable to
         # traverse ANY shortcut: every goal reachable only via a ladder/hole/teleport came
         # back "no route". Meanwhile `reachable_frontier` floods across links freely, so it
@@ -1954,10 +1954,10 @@ async def travel(session: GameSession, item_flags: ItemFlags,
         # the bot chased the same unreachable tile forever. Subtract the links we mean to
         # use, so the two agree on what "reachable" means.
         links = colony.get_links()
-        route = find_route(colony.get_walkable(), links, here, goal,
+        route = find_shared_route(colony.get_walkable(), links, here, goal,
                            reach=reach, avoid=colony.get_hazards() - set(links),
                            costs=colony.get_walk_costs(),
-                           step_unconfirmed=colony.get_step_unconfirmed())
+                           unconfirmed_crossings=colony.get_unconfirmed_crossings())
         if route is None:
             # Nothing in the shared map connects us — normal when the goal is somewhere
             # nobody has been, or when we're standing in a not-yet-connected pocket.
@@ -1967,7 +1967,7 @@ async def travel(session: GameSession, item_flags: ItemFlags,
             # — 68 steps. Returning here instead of re-planning threw that away.)
             log.info("travel: no route from %s to (%d,%d,%d) in the known world; "
                      "trying local navigation", here, goal_x, goal_y, goal_z)
-            await _walk_to(session, item_flags, goal_x, goal_y)
+            await _walk_local(session, item_flags, goal_x, goal_y)
             colony.contribute_tiles(session.state)   # publish what we just revealed
             p = session.state.position
             if p is None:
@@ -1985,15 +1985,15 @@ async def travel(session: GameSession, item_flags: ItemFlags,
 
         if first_teleport is None:
             # Pure on-foot route (same floor / same region). Follow the route we just
-            # planned over the shared map — NOT `_walk_to`, which would discard it and
-            # re-guess from this bot's private, ~8-tile view (see `_walk_shared`).
-            if await _walk_shared(session, item_flags, goal_x, goal_y, goal_z,
+            # planned over the shared map — NOT `_walk_local`, which would discard it and
+            # re-guess from this bot's private, ~8-tile view (see `_follow_shared_route`).
+            if await _follow_shared_route(session, item_flags, goal_x, goal_y, goal_z,
                                   reach=reach):
                 continue
             # The shared route ran out (unexplored last stretch, or we got pushed off
             # it). Feel the rest of the way locally, then re-plan: what we just walked
             # over may complete the map.
-            await _walk_to(session, item_flags, goal_x, goal_y)
+            await _walk_local(session, item_flags, goal_x, goal_y)
             colony.contribute_tiles(session.state)
             p = session.state.position
             if p is None:
@@ -2011,9 +2011,9 @@ async def travel(session: GameSession, item_flags: ItemFlags,
         if here != launch:
             # Walk on foot to the launch tile (same floor as us), following the shared
             # route; fall back to local navigation only if that can't do it.
-            if not await _walk_shared(session, item_flags, launch[0], launch[1],
+            if not await _follow_shared_route(session, item_flags, launch[0], launch[1],
                                       launch[2]):
-                await _walk_to(session, item_flags, launch[0], launch[1])
+                await _walk_local(session, item_flags, launch[0], launch[1])
             p = session.state.position
             if p is None or (p.x, p.y, p.z) != launch:
                 log.info("travel: couldn't reach shortcut launch %s; aborting", launch)
@@ -2414,14 +2414,14 @@ async def scout(session: GameSession, item_flags: ItemFlags,
             if await _try_use_object(session, item_flags, tried_objects,
                                      max_dist=_USE_OBJECT_RADIUS):
                 pass  # attempted a nearby ladder/hole/grate/door (status set inside)
-            elif await _try_descend(session, item_flags, tried_descents,
+            elif await _try_change_floor(session, item_flags, tried_descents,
                                     max_dist=_DESCENT_RADIUS):
                 # A nearby way DOWN we recognise: a hole / trapdoor / down-stairs we step
                 # onto, or a sewer grate we use. Tried before any map-wide link so a scout
                 # actually uses the exit in its own room instead of trekking off to a
                 # distant one it may not even be able to reach.
                 pass  # attempted a local descent (status set inside)
-            elif await _try_descend(session, item_flags, tried_descents,
+            elif await _try_change_floor(session, item_flags, tried_descents,
                                     max_dist=_DESCENT_RADIUS, direction="up"):
                 # A nearby UP-staircase. Down is preferred (that's how a scout ranges into
                 # new territory), but a room whose only exit is up-stairs would otherwise
@@ -2443,7 +2443,7 @@ async def scout(session: GameSession, item_flags: ItemFlags,
                 # No known way off this floor yet — hop somewhere far to bump into
                 # (and thus discover) an undiscovered staircase/teleport.
                 session.decide("seeking exit", "no known way off floor")
-                await _walk_to(session, item_flags,
+                await _walk_local(session, item_flags,
                                pos.x + random.randint(-30, 30),
                                pos.y + random.randint(-30, 30),
                                max_steps=40, plan_radius=_PLAN_RADIUS)
@@ -2546,7 +2546,7 @@ async def navigate_to(session: GameSession, item_flags: ItemFlags,
     BLOCKED/DETOURED BY A CREATURE. A door or a wrong floor aren't the only things that
     can stand between here and there — a monster (or another bot/player) parked in a
     single-tile corridor does too, and unlike terrain, an occupied tile is never durably
-    blocked (see `_walk_to`'s "rejected" handling), so re-planning around it can spin
+    blocked (see `_walk_local`'s "rejected" handling), so re-planning around it can spin
     forever if it's the ONLY route. This loop tracks net progress round to round; once
     we've gone genuinely nowhere for `_NAV_FIGHT_THRESHOLD` rounds, it escalates the same
     way `scout` always has for its own travel (see `_fight_free`/`_escape_step`) — melee
@@ -2613,14 +2613,14 @@ async def navigate_to(session: GameSession, item_flags: ItemFlags,
             # in the target's direction and take it (z is SMALLER higher up in Tibia). This
             # is the scout's own floor-change hunt: a hole/down-stair we step onto or a
             # grate we use for DOWN, an up-staircase for UP.
-            await _try_descend(session, item_flags, floor_tried,
+            await _try_change_floor(session, item_flags, floor_tried,
                                max_dist=_DESCENT_RADIUS,
                                direction="up" if z < pos.z else "down")
         else:
             # Right floor — walk toward the target. If that gets us nowhere, an obstacle
             # (a closed door, or — for a caller that allows it — any known exit) may block
             # the only route: clear the nearest one the walker parked us beside.
-            await _walk_to(session, item_flags, x, y,
+            await _walk_local(session, item_flags, x, y,
                            max_steps=60, plan_radius=_PLAN_RADIUS)
             after = session.state.position
             after_t = (after.x, after.y, after.z) if after is not None else None
@@ -2652,7 +2652,7 @@ async def goto_session(host: str, login_port: int, account: str, password: str,
     async def action(session: GameSession) -> None:
         await asyncio.sleep(0.2)  # let the snapshot finish parsing
         log.info("walking from %s to (%d, %d)...", session.state.position, goal_x, goal_y)
-        await _walk_to(session, item_flags, goal_x, goal_y)
+        await _walk_local(session, item_flags, goal_x, goal_y)
         log.info("final map at %s:\n%s",
                  session.state.position, render_ascii(session.state, item_flags))
 
@@ -3301,7 +3301,7 @@ async def explore_session(host: str, login_port: int, account: str, password: st
             # each re-plan to the local neighbourhood for cheap planning at scale.
             dist = abs(target_x - pos.x) + abs(target_y - pos.y)
             budget = min(60, dist * 2 + 8)
-            await _walk_to(session, item_flags, target_x, target_y,
+            await _walk_local(session, item_flags, target_x, target_y,
                            max_steps=budget, plan_radius=_PLAN_RADIUS,
                            log_stuck=is_frontier)
             after = session.state.position

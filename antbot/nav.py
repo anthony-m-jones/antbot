@@ -47,7 +47,7 @@ MIN_GROUND_SPEED = 100
 route_log = logging.getLogger("antbot.route")
 
 
-def unconfirmed_step_cost(tile: tuple[int, int, int], goal_x: int, goal_y: int) -> int:
+def unconfirmed_crossing_cost(tile: tuple[int, int, int], goal_x: int, goal_y: int) -> int:
     """The OPTIMISTIC lower-bound cost of gambling on an unconfirmed STEP-type floor-
     change (a hole/open-stairs/teleporter we've SEEN but never actually crossed) as a
     shortcut to (goal_x, goal_y), instead of its ordinary ground cost.
@@ -162,8 +162,8 @@ def has_standable_neighbour(state: GameState, item_flags: ItemFlags,
     return False
 
 
-def find_path(state: GameState, item_flags: ItemFlags,
-              goal_x: int, goal_y: int) -> list[str] | None:
+def find_path_on_floor(state: GameState, item_flags: ItemFlags,
+                        goal_x: int, goal_y: int) -> list[str] | None:
     """A* from our current position to (goal_x, goal_y) on the same floor.
 
     Returns the list of step directions to walk (e.g. ["north", "north", "east"]),
@@ -323,14 +323,14 @@ def find_frontier(state: GameState, item_flags: ItemFlags,
     return None
 
 
-def find_path_toward(state: GameState, item_flags: ItemFlags,
-                     goal_x: int, goal_y: int,
-                     max_radius: int | None = None,
-                     extra_walkable: set[tuple[int, int, int]] | None = None,
-                     registry=None,
-                     confirmed_links: set[tuple[int, int, int]] | None = None,
-                     step_unconfirmed: set[tuple[int, int, int]] | None = None,
-                     ) -> list[str] | None:
+def find_nearest_step_toward(state: GameState, item_flags: ItemFlags,
+                              goal_x: int, goal_y: int,
+                              max_radius: int | None = None,
+                              extra_walkable: set[tuple[int, int, int]] | None = None,
+                              registry=None,
+                              confirmed_links: set[tuple[int, int, int]] | None = None,
+                              unconfirmed_crossings: set[tuple[int, int, int]] | None = None,
+                              ) -> list[str] | None:
     """Path *toward* (goal_x, goal_y), even if it's beyond what we've seen.
 
     This is what makes `goto` work across screens (B3). The goal tile usually
@@ -363,27 +363,27 @@ def find_path_toward(state: GameState, item_flags: ItemFlags,
 
     `registry` + `confirmed_links` (pass `colony.traversal` / `set(colony.get_links())`)
     price an UNCONFIRMED STEP-type floor-change (a hole/open-stairs/teleporter we've SEEN
-    but never crossed) at `unconfirmed_step_cost` instead of its ordinary ground cost —
+    but never crossed) at `unconfirmed_crossing_cost` instead of its ordinary ground cost —
     see that function for why. Without this, an ordinary walk toward (goal_x, goal_y) can
     silently step onto one mid-route (it's not blocking, so `is_walkable` allows it) and
     get relocated somewhere else entirely. Omit both (the default) to skip this pricing
     entirely — used by callers with no colony to consult.
 
-    `step_unconfirmed` (pass `colony.get_step_unconfirmed()`) is a SEPARATE, cheaper check
+    `unconfirmed_crossings` (pass `colony.get_unconfirmed_crossings()`) is a SEPARATE, cheaper check
     for the SAME kind of tile, and matters for a gap `registry`/`confirmed_links` alone
     can't close: those two can only classify a tile whose CONTENTS are already in `state.
     tiles` — this bot's own, private view. A tile reachable only through `extra_walkable`
     (the colony's shared walkable set) may be a hazard some OTHER bot already discovered
     and reported, with nothing in this bot's own view to classify at all — silently falling
-    through as ordinary ground otherwise. `colony.get_step_unconfirmed()` is already a plain
+    through as ordinary ground otherwise. `colony.get_unconfirmed_crossings()` is already a plain
     tile membership set (no item stack needed to consult it), built the same way for
-    `find_route`, so passing it here gives the local walker the SAME colony-wide hazard
+    `find_shared_route`, so passing it here gives the local walker the SAME colony-wide hazard
     awareness the shared router already has, not just what this bot personally happened to
     see. Checked first (cheaper, and authoritative — the colony set is already maintained to
     drop a tile the moment it's confirmed as a real link); local classification is the
     fallback for anything only this bot has ever seen.
 
-    LOGGING: emits to the `antbot.route` logger — see `find_route`'s docstring and
+    LOGGING: emits to the `antbot.route` logger — see `find_shared_route`'s docstring and
     `nav.route_log`.
 
     Returns the directions toward that best frontier tile, or None if we can't get
@@ -428,10 +428,10 @@ def find_path_toward(state: GameState, item_flags: ItemFlags,
         # it doesn't look at cost at all — so an expensive gamble that happens to sit
         # geometrically nearer the goal (very possible: the real route often has to
         # detour AWAY from the goal first to get around a wall) would otherwise win by
-        # sheer coordinates despite `unconfirmed_step_cost` correctly pricing it as
+        # sheer coordinates despite `unconfirmed_crossing_cost` correctly pricing it as
         # expensive. That priced-but-still-selected combination is exactly the bug this
         # test isolated: the gamble cost only ordered WHEN Dijkstra visited it, never
-        # whether it got PICKED. Crossing one on purpose stays `_try_descend`'s job;
+        # whether it got PICKED. Crossing one on purpose stays `_try_change_floor`'s job;
         # ordinary walking should just report "no closer ordinary tile" and let the
         # caller's stuck-handling escalate to that deliberate hunt instead.
         if distance < best_dist and current not in gambled_tiles:
@@ -462,7 +462,7 @@ def find_path_toward(state: GameState, item_flags: ItemFlags,
             # this is what catches a hazard some OTHER bot discovered that THIS bot has
             # never personally seen). Fall back to classifying our OWN view for anything
             # only we have laid eyes on, which the shared set wouldn't know about yet.
-            if step_unconfirmed is not None and n_tile in step_unconfirmed:
+            if unconfirmed_crossings is not None and n_tile in unconfirmed_crossings:
                 gamble = True
             else:
                 gamble = False
@@ -475,7 +475,7 @@ def find_path_toward(state: GameState, item_flags: ItemFlags,
                             kind = registry.kind(hit[0])
                             if kind is not None and kind.action == "step":
                                 gamble = True
-            step = (unconfirmed_step_cost(n_tile, goal_x, goal_y) if gamble
+            step = (unconfirmed_crossing_cost(n_tile, goal_x, goal_y) if gamble
                    else tile_cost(state, item_flags, neighbor[0], neighbor[1], z))
             nd = cost + step
             improved = nd < best_cost.get(neighbor, 1 << 30)
@@ -496,12 +496,12 @@ def find_path_toward(state: GameState, item_flags: ItemFlags,
 
     if best == start:
         if debug:
-            route_log.debug("find_path_toward: nothing reachable is closer than %s to %s",
+            route_log.debug("find_nearest_step_toward: nothing reachable is closer than %s to %s",
                             start, goal)
         return None  # nothing reachable is closer than where we already stand
     path = _reconstruct(came_from, best)
     if best in gambled_tiles:
-        route_log.info("find_path_toward: DECIDED to head for an unconfirmed z-hop at "
+        route_log.info("find_nearest_step_toward: DECIDED to head for an unconfirmed z-hop at "
                        "%s (best reachable tile toward %s from %s)", best, goal, start)
     return path
 
@@ -682,18 +682,18 @@ def within_reach(node: tuple[int, int, int], goal: tuple[int, int, int],
             and max(abs(node[0] - goal[0]), abs(node[1] - goal[1])) <= reach)
 
 
-def find_route(walkable: set[tuple[int, int, int]],
-               links: dict[tuple[int, int, int], tuple[int, int, int]],
-               start: tuple[int, int, int],
-               goal: tuple[int, int, int],
-               reach: int = 0,
-               avoid: set[tuple[int, int, int]] | None = None,
-               costs: dict[tuple[int, int, int], int] | None = None,
-               step_unconfirmed: set[tuple[int, int, int]] | None = None,
-               ) -> list[tuple[str, bool, tuple[int, int, int]]] | None:
+def find_shared_route(walkable: set[tuple[int, int, int]],
+                      links: dict[tuple[int, int, int], tuple[int, int, int]],
+                      start: tuple[int, int, int],
+                      goal: tuple[int, int, int],
+                      reach: int = 0,
+                      avoid: set[tuple[int, int, int]] | None = None,
+                      costs: dict[tuple[int, int, int], int] | None = None,
+                      unconfirmed_crossings: set[tuple[int, int, int]] | None = None,
+                      ) -> list[tuple[str, bool, tuple[int, int, int]]] | None:
     """Route across the *whole known world*, using teleports/stairs as shortcuts.
 
-    Unlike `find_path` (single floor, on-foot only), this searches the colony's
+    Unlike `find_path_on_floor` (single floor, on-foot only), this searches the colony's
     entire shared walkable map plus the learned links, so a far goal on another
     floor or in another region is reachable by stepping through a teleport. Nodes
     are absolute (x, y, z); edges are:
@@ -722,8 +722,8 @@ def find_route(walkable: set[tuple[int, int, int]],
     fewest-tiles behaviour. A teleport hop is priced at the cheapest possible step: it is
     effectively instant, and must never look worse than walking.
 
-    `step_unconfirmed` (pass `colony.get_step_unconfirmed()`) prices a tile at
-    `unconfirmed_step_cost` toward `goal` instead of its ordinary `costs` value — see
+    `unconfirmed_crossings` (pass `colony.get_unconfirmed_crossings()`) prices a tile at
+    `unconfirmed_crossing_cost` toward `goal` instead of its ordinary `costs` value — see
     that function. These are STEP-type floor-changes (holes/open-stairs/teleporters)
     we've SEEN but never actually crossed: they aren't in `links` yet, so without this
     they're just ordinary walkable ground to this search, and a route can walk straight
@@ -739,23 +739,23 @@ def find_route(walkable: set[tuple[int, int, int]],
     `resulting_position` instead of the adjacent tile.
 
     LOGGING: emits to the `antbot.route` logger at DEBUG (every edge relaxed) and INFO
-    (a step_unconfirmed tile actually winning a spot on the final route) — see
+    (a unconfirmed_crossings tile actually winning a spot on the final route) — see
     `nav.route_log`. Off by default; turn it on to watch the search's own reasoning.
     """
     if within_reach(start, goal, reach):
         return []
 
     avoid = avoid or set()
-    step_unconfirmed = step_unconfirmed or set()
+    unconfirmed_crossings = unconfirmed_crossings or set()
     dist = {start: 0}
     prev: dict[tuple[int, int, int], tuple[tuple[int, int, int], str, bool]] = {}
     heap: list[tuple[int, tuple[int, int, int]]] = [(0, start)]
     target: tuple[int, int, int] | None = None
     debug = route_log.isEnabledFor(logging.DEBUG)
     if debug:
-        route_log.debug("find_route: start=%s goal=%s reach=%d, %d unconfirmed z-hop "
+        route_log.debug("find_shared_route: start=%s goal=%s reach=%d, %d unconfirmed z-hop "
                         "candidate(s) in view: %s",
-                        start, goal, reach, len(step_unconfirmed), sorted(step_unconfirmed))
+                        start, goal, reach, len(unconfirmed_crossings), sorted(unconfirmed_crossings))
 
     while heap:
         d, node = heapq.heappop(heap)
@@ -781,11 +781,11 @@ def find_route(walkable: set[tuple[int, int, int]],
             # Both branches must be in the SAME units, or the router mis-prices one of
             # them badly. A teleport is instant, so it costs the cheapest step there is —
             # never more than walking, or we'd trudge straight past a portal.
-            gamble = not teleport and landing in step_unconfirmed
+            gamble = not teleport and landing in unconfirmed_crossings
             if teleport:
                 step = MIN_GROUND_SPEED
             elif gamble:
-                step = unconfirmed_step_cost(landing, goal[0], goal[1])
+                step = unconfirmed_crossing_cost(landing, goal[0], goal[1])
             elif costs:
                 step = costs.get(landing, DEFAULT_GROUND_SPEED)
             else:
@@ -806,7 +806,7 @@ def find_route(walkable: set[tuple[int, int, int]],
 
     if target is None or target not in prev:
         if debug:
-            route_log.debug("find_route: NO ROUTE found from %s to %s", start, goal)
+            route_log.debug("find_shared_route: NO ROUTE found from %s to %s", start, goal)
         return None
 
     route: list[tuple[str, bool, tuple[int, int, int]]] = []
@@ -817,13 +817,13 @@ def find_route(walkable: set[tuple[int, int, int]],
         node = came
     route.reverse()
 
-    gambled_on = [land for _n, _tp, land in route if land in step_unconfirmed]
+    gambled_on = [land for _n, _tp, land in route if land in unconfirmed_crossings]
     if gambled_on:
-        route_log.info("find_route: DECIDED to cross unconfirmed z-hop(s) %s en route "
+        route_log.info("find_shared_route: DECIDED to cross unconfirmed z-hop(s) %s en route "
                        "%s -> %s (total cost %d) — betting the optimistic estimate beats "
                        "the known alternative", gambled_on, start, goal, dist.get(target, -1))
     elif debug:
-        route_log.debug("find_route: settled on an all-confirmed-ground route %s -> %s "
+        route_log.debug("find_shared_route: settled on an all-confirmed-ground route %s -> %s "
                         "(total cost %d)", start, goal, dist.get(target, -1))
     return route
 

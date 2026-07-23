@@ -593,7 +593,7 @@ def process_world_frame(payload: bytes, state: GameState, item_flags: ItemFlags)
             # A full map re-send mid-session means we were relocated — this is how
             # the server delivers a TELEPORT (it sends 0x6C to remove us, then this
             # 0x64 centred on the destination), not a 0x6D move. Read the new
-            # position, adopt it, and parse the fresh surroundings. _walk_to sees
+            # position, adopt it, and parse the fresh surroundings. _walk_local sees
             # that we didn't land where a step should and flags the tile a hazard.
             new = Position(reader.u16(), reader.u16(), reader.u8())
             state.position = new
