@@ -145,6 +145,16 @@
   .children.collapsed{display:none}
   .call-row.hidden-by-filter{display:none}
 
+  /* ---- test/phase sections — which test a chunk of calls belongs to ---- */
+  .section-header{
+    position:sticky; top:0; z-index:1; background:var(--raised-2);
+    border-top:1px solid var(--line-3); border-bottom:1px solid var(--line-3);
+    padding:6px 12px; font-family:var(--mono); font-size:11px; font-weight:700;
+    color:var(--accent); text-transform:uppercase; letter-spacing:.04em;
+  }
+  .section-header:first-child{border-top:none}
+  .section-body{padding:4px 0 8px 0}
+
   /* ---- inline frame-grid widget ---- */
   .grid-widget{
     margin:6px 0 10px 20px; border:1px solid var(--line-2); border-radius:var(--r);
@@ -224,6 +234,7 @@
     <div class="section">
       <h2>File totals</h2>
       <div class="stat-grid" id="file-stats">
+        <div class="stat"><div class="n" id="stat-tests">0</div><div class="l">test sections</div></div>
         <div class="stat"><div class="n" id="stat-calls">0</div><div class="l">calls</div></div>
         <div class="stat"><div class="n" id="stat-searches">0</div><div class="l">searches</div></div>
         <div class="stat"><div class="n" id="stat-events">0</div><div class="l">total events</div></div>
@@ -259,41 +270,63 @@ function parseJsonl(text) {
 
 // A CallNode: {callId, parentId, depth, qualname, args, kwargs, position,
 //              returnEvent, raiseEvent, frames: [...], children: [...]}
-function buildCallTree(events) {
-  const byId = new Map();
-  const roots = [];
-  let searchCount = 0;
+//
+// A Section: {name, phase, roots: [CallNode], byId: Map<callId, CallNode>} — one per
+// "test" marker `navtests._mark_test` emits (see navtests.py), so a file covering more
+// than one test (the whole suite, or one efficiency test's cold AND warm pass) reads as
+// clearly separated groups instead of one undifferentiated pile of calls. Calls seen
+// before the FIRST "test" marker (a legacy file, or a recorder used outside navtests.py)
+// land in an "(untitled)" section rather than being dropped.
+function buildSections(events) {
+  const sections = [];
+  let current = null;
+  let callCount = 0, searchCount = 0;
+
+  const ensureSection = () => {
+    if (!current) {
+      current = { name: "(untitled)", phase: null, roots: [], byId: new Map() };
+      sections.push(current);
+    }
+    return current;
+  };
 
   for (const e of events) {
+    if (e.kind === "test") {
+      current = { name: e.name, phase: e.phase || null, roots: [], byId: new Map() };
+      sections.push(current);
+      continue;
+    }
     if (e.kind === "call") {
+      const section = ensureSection();
+      callCount++;
       const node = {
         callId: e.call_id, parentId: e.parent_id, depth: e.depth ?? 0,
         qualname: e.qualname, args: e.args || [], kwargs: e.kwargs || {},
         position: e.position || null, returnEvent: null, raiseEvent: null,
         frames: [], children: [],
       };
-      byId.set(e.call_id, node);
-      if (e.parent_id != null && byId.has(e.parent_id)) {
-        byId.get(e.parent_id).children.push(node);
+      section.byId.set(e.call_id, node);
+      if (e.parent_id != null && section.byId.has(e.parent_id)) {
+        section.byId.get(e.parent_id).children.push(node);
       } else {
-        roots.push(node);
+        section.roots.push(node);
       }
     } else if (e.kind === "return") {
-      const node = byId.get(e.call_id);
+      const node = current && current.byId.get(e.call_id);
       if (node) node.returnEvent = e;
     } else if (e.kind === "raise") {
-      const node = byId.get(e.call_id);
+      const node = current && current.byId.get(e.call_id);
       if (node) node.raiseEvent = e;
     } else {
       // A frame event (start/pop/relax/done/no_route) — attach to its owning call.
-      const node = e.call_id != null ? byId.get(e.call_id) : null;
+      const node = (current && e.call_id != null) ? current.byId.get(e.call_id) : null;
       if (node) {
         node.frames.push(e);
         if (e.kind === "start") searchCount++;
       }
     }
   }
-  return { roots, byId, callCount: byId.size, searchCount };
+  return { sections, callCount, searchCount };
 }
 
 // ---------------------------------------------------------------------------
@@ -539,7 +572,7 @@ class FrameGridWidget {
 // ---------------------------------------------------------------------------
 // Call tree DOM rendering
 // ---------------------------------------------------------------------------
-let TREE = null;   // {roots, byId, callCount, searchCount}
+let TREE = null;   // {sections, callCount, searchCount}
 const widgets = new Map(); // callId -> FrameGridWidget, for calls currently expanded
 
 function qualnameParts(qualname) {
@@ -638,10 +671,22 @@ function renderTree() {
   const container = document.getElementById("call-tree");
   container.innerHTML = "";
   widgets.clear();
-  for (const root of TREE.roots) renderCallNode(root, container);
+  let totalRoots = 0;
+  for (const section of TREE.sections) {
+    const header = document.createElement("div");
+    header.className = "section-header";
+    header.textContent = section.phase ? `${section.name}  ·  ${section.phase}` : section.name;
+    container.appendChild(header);
+    const body = document.createElement("div");
+    body.className = "section-body";
+    for (const root of section.roots) renderCallNode(root, body);
+    container.appendChild(body);
+    totalRoots += section.roots.length;
+  }
   document.getElementById("stat-calls").textContent = TREE.callCount;
   document.getElementById("stat-searches").textContent = TREE.searchCount;
-  document.getElementById("stat-roots").textContent = TREE.roots.length;
+  document.getElementById("stat-roots").textContent = totalRoots;
+  document.getElementById("stat-tests").textContent = TREE.sections.length;
 }
 
 function setAllCollapsed(collapsed) {
@@ -679,7 +724,7 @@ function applyFilter(needle) {
 // ---------------------------------------------------------------------------
 function loadText(text) {
   const events = parseJsonl(text);
-  TREE = buildCallTree(events);
+  TREE = buildSections(events);
   document.getElementById("stat-events").textContent = events.length;
   document.getElementById("empty-state").style.display = "none";
   renderTree();

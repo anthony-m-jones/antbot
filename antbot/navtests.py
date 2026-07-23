@@ -420,6 +420,7 @@ async def _drive(colony: Colony, flags: ItemFlags, test: NavTest) -> Result:
 
 
 async def run_test(test: NavTest) -> Result:
+    _mark_test(test.name)
     print(f"\n>>> {test.name}")
     print(f"    start {test.start} -> dest {test.dest}, limit {test.time_limit:.0f}s")
 
@@ -582,6 +583,7 @@ async def run_efficiency(test: NavTest, phases: list[str], trace: bool,
         makes cold and warm independently reproducible, which is what lets you iterate on each
         one on its own.
         """
+        _mark_test(test.name, phase=phase)
         # Both phases start from a colony with NO persisted map (hazard_file=None); the
         # traversal registry is still catalog-seeded, so the bot recognizes a ladder/door on
         # sight — that's the rules of the world, not its layout.
@@ -763,6 +765,20 @@ def _default_frame_log_path() -> Path:
     help text; this auto path never collides in the first place)."""
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     return FRAME_LOG_DIR / f"{stamp}.jsonl"
+
+
+def _mark_test(name: str, phase: str | None = None, **extra: object) -> None:
+    """Drop a "which test is this" marker into whatever EventRecorder is bound (see
+    tracing.bind_recorder). Without this, a --frame-log file covering more than one test
+    (running the whole suite, or one efficiency test's cold AND warm pass) has no way to
+    tell you which chunk of calls belongs to which test just by looking at the events —
+    exactly the confusion that prompted adding this. A no-op if no recorder is bound.
+    frame_viewer.html groups the call tree into labeled sections on this event; see
+    `_build_sections` there.
+    """
+    recorder = tracing.current_recorder()
+    if recorder is not None:
+        recorder.emit("test", name=name, phase=phase, **extra)
 
 
 def main() -> None:
