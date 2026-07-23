@@ -233,11 +233,17 @@ async def build(item_flags: ItemFlags, name: str, start: Tile, dest: Tile,
         # through an object that would really relocate you, freezing a par_cost no bot could
         # actually achieve. See navcost.compute_par's docstring.
         unconfirmed_crossings = colony.get_unconfirmed_crossings()
+        # Same reasoning, for a link whose SOURCE the reveal/real-navigate DID cross: if it's
+        # USE-type (a grate), find_shared_route must not treat merely arriving there as an
+        # automatic relocation, or a start/dest that sits exactly on it gets solved with an
+        # artificial detour (or looks unreachable). See navcost.compute_par's docstring.
+        step_links = colony.get_step_links()
         # The destination sits behind the (now open) door, so its tile is walkable in the
         # reveal. If it somehow isn't reachable, the reveal was incomplete — surface that
         # rather than freezing a bogus floor.
         solved = navcost.compute_par(walkable, links, costs, start, dest,
-                                     unconfirmed_crossings=unconfirmed_crossings)
+                                     unconfirmed_crossings=unconfirmed_crossings,
+                                     step_links=step_links)
         if solved is None:
             result["error"] = (
                 f"could not solve an optimal route {start} -> {dest} over the revealed "

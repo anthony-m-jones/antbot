@@ -690,6 +690,7 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
                       avoid: set[tuple[int, int, int]] | None = None,
                       costs: dict[tuple[int, int, int], int] | None = None,
                       unconfirmed_crossings: set[tuple[int, int, int]] | None = None,
+                      step_links: set[tuple[int, int, int]] | None = None,
                       ) -> list[tuple[str, bool, tuple[int, int, int]]] | None:
     """Route across the *whole known world*, using teleports/stairs as shortcuts.
 
@@ -697,9 +698,9 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
     entire shared walkable map plus the learned links, so a far goal on another
     floor or in another region is reachable by stepping through a teleport. Nodes
     are absolute (x, y, z); edges are:
-      - a cardinal step to an adjacent walkable tile (cost 1), and
+      - a cardinal step to an adjacent walkable tile (cost = its ground speed), and
       - stepping onto a link source tile, which lands you at its destination
-        (cost 1) — the teleport/stairs used as a highway.
+        (cost = MIN_GROUND_SPEED) — the teleport/stairs used as a highway.
 
     We use Dijkstra rather than A*: a teleport can make the true distance far
     shorter than the Manhattan estimate, which would make an A* heuristic
@@ -730,13 +731,34 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
     onto one and get relocated somewhere else. Once a tile like this is actually crossed
     it moves into `links` and this no longer applies to it.
 
+    `step_links` (pass `colony.get_step_links()`) is the subset of `links` sources that are
+    STEP-type — walking onto them IS the trigger (a hole/open-stairs/teleporter), so for
+    THOSE the only edge modeled is the teleport (there's no physically valid "just stand on
+    it" alternative). Every OTHER `links` source is USE-type (a ladder/grate/door): walking
+    onto or near it does nothing on its own, so it gets BOTH an ordinary-ground edge (arrive
+    and just stand there, e.g. because that tile IS the goal) and the teleport edge
+    (deliberately use it, e.g. because the goal is on the other side) — Dijkstra picks
+    whichever the actual goal makes cheaper. Omitting `step_links` (None) falls back to
+    treating every link as STEP-type — the old, more conservative behavior, kept as the
+    default so an existing caller that hasn't been updated to pass it doesn't change
+    behavior. Getting this distinction wrong was a real bug: without it, a goal that
+    happened to sit exactly on a known USE-type shortcut's source tile became permanently
+    unreachable as "just stand here" — the router believed merely arriving there triggered
+    an instant relocation past it.
+
     `start` is always a legal node even if it isn't in `walkable`: we are, self
-    evidently, standing on it, whatever the map believes.
+    evidently, standing on it, whatever the map believes. If `start` itself is a link
+    source, we ALSO seed the "trigger it right here" edge (see below the initial `dist`
+    setup) — the ordinary edge-generation loop only discovers a link by WALKING onto it
+    from a neighbour, which can't happen for the very first node.
 
     Returns a list of (direction, is_teleport, resulting_position) steps, or None
     if the goal isn't reachable through what we've explored. `is_teleport` marks a
     step where walking `direction` puts you onto a link tile and whisks you to
-    `resulting_position` instead of the adjacent tile.
+    `resulting_position` instead of the adjacent tile. The FIRST step's direction may be
+    the sentinel `"__here__"` instead of a cardinal name, meaning "trigger the link you
+    already start on" — no walk or adjacency math applies; see `client.travel`'s hop
+    execution, which recognizes it.
 
     LOGGING: emits to the `antbot.route` logger at DEBUG (every edge relaxed) and INFO
     (a unconfirmed_crossings tile actually winning a spot on the final route) — see
@@ -757,6 +779,22 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
                         "candidate(s) in view: %s",
                         start, goal, reach, len(unconfirmed_crossings), sorted(unconfirmed_crossings))
 
+    # START is itself a link source? Seed the "trigger it right here" edge (sentinel
+    # direction "__here__") — see the docstring. Only relevant for a USE-type source in
+    # practice (you can't be at REST on a STEP-type tile; the step onto it already moved
+    # you), but harmless to offer unconditionally: Dijkstra simply never prefers it if
+    # something cheaper exists.
+    if start in links and start not in avoid and links[start] not in avoid:
+        here_landing = links[start]
+        here_step = MIN_GROUND_SPEED
+        if here_step < dist.get(here_landing, 1 << 60):
+            dist[here_landing] = here_step
+            prev[here_landing] = (start, "__here__", True)
+            heapq.heappush(heap, (here_step, here_landing))
+            if debug:
+                route_log.debug("  seed %s -__here__-> %s  step=%d (start is itself a link)",
+                                start, here_landing, here_step)
+
     while heap:
         d, node = heapq.heappop(heap)
         if within_reach(node, goal, reach):
@@ -769,40 +807,48 @@ def find_shared_route(walkable: set[tuple[int, int, int]],
             adjacent = (x + dx, y + dy, z)
             if adjacent in avoid:
                 continue
-            if adjacent in links:
-                # Stepping onto this tile teleports us to its destination.
-                landing, teleport = links[adjacent], True
-            elif adjacent in walkable:
-                landing, teleport = adjacent, False
+            is_link = adjacent in links
+            is_step_link = is_link and (step_links is None or adjacent in step_links)
+            candidates: list[tuple[tuple[int, int, int], bool]] = []
+            if is_step_link:
+                # STEP-type: the walk itself IS the trigger, so only the teleport exists.
+                candidates.append((links[adjacent], True))
             else:
-                continue
-            if landing in avoid:
-                continue
-            # Both branches must be in the SAME units, or the router mis-prices one of
-            # them badly. A teleport is instant, so it costs the cheapest step there is —
-            # never more than walking, or we'd trudge straight past a portal.
-            gamble = not teleport and landing in unconfirmed_crossings
-            if teleport:
-                step = MIN_GROUND_SPEED
-            elif gamble:
-                step = unconfirmed_crossing_cost(landing, goal[0], goal[1])
-            elif costs:
-                step = costs.get(landing, DEFAULT_GROUND_SPEED)
-            else:
-                step = 1        # unpriced: every step equal, the old fewest-tiles rule
-            nd = d + step
-            improved = nd < dist.get(landing, 1 << 60)
-            if debug:
-                route_log.debug(
-                    "  relax %s -%s-> %s  step=%d (%s)  total=%d%s%s",
-                    node, name, landing, step,
-                    "GAMBLE unconfirmed z-hop" if gamble else ("link" if teleport else "ground"),
-                    nd, " -> confirmed link" if teleport else "",
-                    " [IMPROVED]" if improved else " [no improvement, skipped]")
-            if improved:
-                dist[landing] = nd
-                prev[landing] = (node, name, teleport)
-                heapq.heappush(heap, (nd, landing))
+                if adjacent in walkable:
+                    candidates.append((adjacent, False))       # ordinary ground — this is
+                                                                # also a USE-type link's OWN
+                                                                # tile, reachable without
+                                                                # using it
+                if is_link:
+                    candidates.append((links[adjacent], True))  # ALSO: deliberately use it
+            for landing, teleport in candidates:
+                if landing in avoid:
+                    continue
+                # Both branches must be in the SAME units, or the router mis-prices one of
+                # them badly. A teleport is instant, so it costs the cheapest step there is —
+                # never more than walking, or we'd trudge straight past a portal.
+                gamble = not teleport and landing in unconfirmed_crossings
+                if teleport:
+                    step = MIN_GROUND_SPEED
+                elif gamble:
+                    step = unconfirmed_crossing_cost(landing, goal[0], goal[1])
+                elif costs:
+                    step = costs.get(landing, DEFAULT_GROUND_SPEED)
+                else:
+                    step = 1        # unpriced: every step equal, the old fewest-tiles rule
+                nd = d + step
+                improved = nd < dist.get(landing, 1 << 60)
+                if debug:
+                    route_log.debug(
+                        "  relax %s -%s-> %s  step=%d (%s)  total=%d%s%s",
+                        node, name, landing, step,
+                        "GAMBLE unconfirmed z-hop" if gamble else ("link" if teleport else "ground"),
+                        nd, " -> confirmed link" if teleport else "",
+                        " [IMPROVED]" if improved else " [no improvement, skipped]")
+                if improved:
+                    dist[landing] = nd
+                    prev[landing] = (node, name, teleport)
+                    heapq.heappush(heap, (nd, landing))
 
     if target is None or target not in prev:
         if debug:

@@ -120,7 +120,8 @@ def route_cost(path: Sequence[Tile], cost_of: Callable[[Tile], int]) -> int:
 
 def compute_par(walkable: set[Tile], links: dict[Tile, Tile], costs: Mapping[Tile, int],
             start: Tile, dest: Tile, reach: int = 0,
-            unconfirmed_crossings: set[Tile] | None = None) -> tuple[int, list[Tile]] | None:
+            unconfirmed_crossings: set[Tile] | None = None,
+            step_links: set[Tile] | None = None) -> tuple[int, list[Tile]] | None:
     """The time-optimal route from `start` to `dest` over a fully-revealed map — the FLOOR.
 
     Delegates the search to nav.find_shared_route (weighted Dijkstra over the shared walkable graph
@@ -146,9 +147,17 @@ def compute_par(walkable: set[Tile], links: dict[Tile, Tile], costs: Mapping[Til
     region with such an object froze a par_cost lower than any bot (cold OR warm) could
     actually achieve, since both correctly refuse to gamble through it. Omitting this
     (the old behavior) is only correct for a region with no such loose ends.
+
+    `step_links` (pass `colony.get_step_links()` from the SAME reveal) matters whenever
+    `start` or `dest` sits exactly on a USE-type shortcut's source tile (a grate is the case
+    that surfaced this): without it, find_shared_route treats EVERY link as auto-teleporting
+    on arrival, so a floor that begins or ends exactly there gets solved with an artificial
+    "walk away and back" detour instead of the true-optimal direct hop — or, worse, a goal
+    exactly on that tile can look unreachable at all. See find_shared_route's docstring.
     """
     route = find_shared_route(walkable, links, start, dest, reach=reach, costs=dict(costs),
-                               unconfirmed_crossings=unconfirmed_crossings)
+                               unconfirmed_crossings=unconfirmed_crossings,
+                               step_links=step_links)
     if route is None:
         return None
     # find_shared_route yields (direction, is_teleport, landing) per step; the tiles we STAND on

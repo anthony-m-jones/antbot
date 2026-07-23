@@ -264,6 +264,15 @@ class Colony:
         self._hazard_file = hazard_file
         self._hazards: set[tuple[int, int, int]] = set()
         self._links: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+        # The subset of `_links` sources that are STEP-type (walking onto them IS the
+        # trigger — a hole/open-stairs/teleporter). A USE-type source (ladder/grate/door)
+        # is in `_links` but deliberately NOT here: walking onto or near it does nothing on
+        # its own, so `find_shared_route` must NOT auto-teleport a bot that merely arrives
+        # there — only `_step_links` membership earns that. Without this distinction, a
+        # goal that happens to sit exactly on a known USE-type shortcut becomes permanently
+        # unreachable as "just stand here": the router treats arrival as an instant relocation
+        # past it. See report_link / find_shared_route's `step_links` param.
+        self._step_links: set[tuple[int, int, int]] = set()
         # Source tiles proven NOT to be a usable shortcut (travel stepped on one
         # and it didn't relocate us) — never trust or re-add these. This is how a
         # mis-recorded teleport source gets pruned so routing stops relying on it.
@@ -363,9 +372,18 @@ class Colony:
                 self._links = {tuple(s): tuple(d) for s, d in data.get("links", [])}
                 self._bad_links = {tuple(t) for t in data.get("bad_links", [])}
                 self._unreachable = {tuple(t) for t in data.get("unreachable", [])}
-            log.info("colony: loaded %d hazards, %d links, %d pruned, %d unreachable from %s",
-                     len(self._hazards), len(self._links), len(self._bad_links),
-                     len(self._unreachable), self._hazard_file)
+                if "step_links" in data:
+                    self._step_links = {tuple(t) for t in data["step_links"]}
+                else:
+                    # File predates the step/use distinction — default every loaded link to
+                    # STEP (the old, conservative behavior: auto-teleport on arrival) rather
+                    # than silently treating a previously-learned USE-type shortcut as one.
+                    # Re-crossing it live re-tags it correctly via report_link going forward.
+                    self._step_links = set(self._links.keys())
+            log.info("colony: loaded %d hazards, %d links (%d step-type), %d pruned, "
+                     "%d unreachable from %s",
+                     len(self._hazards), len(self._links), len(self._step_links),
+                     len(self._bad_links), len(self._unreachable), self._hazard_file)
         except (OSError, ValueError) as err:
             log.warning("colony: could not load world knowledge: %s", err)
 
@@ -376,6 +394,7 @@ class Colony:
             payload = {
                 "hazards": [list(t) for t in self._hazards],
                 "links": [[list(s), list(d)] for s, d in self._links.items()],
+                "step_links": [list(t) for t in self._step_links],
                 "bad_links": [list(t) for t in self._bad_links],
                 "unreachable": [list(t) for t in self._unreachable],
             }
@@ -884,12 +903,17 @@ class Colony:
 
     # -- shared hazard learning -------------------------------------------
 
-    def report_link(self, source: tuple[int, int, int], dest: tuple[int, int, int]) -> None:
-        """A bot found that stepping on `source` whisks it to `dest`.
+    def report_link(self, source: tuple[int, int, int], dest: tuple[int, int, int],
+                    action: str) -> None:
+        """A bot found that `source` leads to `dest` — either by walking onto it (a
+        STEP-type hole/stairs/teleporter, `action="step"`) or by deliberately using it (a
+        USE-type ladder/grate/door, `action="use"`; use_with/cast collapse to "use" too —
+        all three share the property that walking near or onto the tile does nothing on
+        its own).
 
-        Records both the avoid-hazard (source) and the routing shortcut
-        (source -> dest), and persists them. Ignored if the source was previously
-        proven to be a dud (pruned), so we don't resurrect a bad link.
+        Records the routing shortcut (source -> dest), tracks WHICH kind it is (see
+        `_step_links`), and persists both. Ignored if the source was previously proven to
+        be a dud (pruned), so we don't resurrect a bad link.
         """
         with self._lock:
             if source in self._bad_links:
@@ -897,6 +921,10 @@ class Colony:
             changed = source not in self._hazards or self._links.get(source) != dest
             self._hazards.add(source)
             self._links[source] = dest
+            if action == "step":
+                self._step_links.add(source)
+            else:
+                self._step_links.discard(source)
             self._unconfirmed_crossings.discard(source)  # now a real link, not a gamble
             if changed:
                 self._save_knowledge()
@@ -905,7 +933,10 @@ class Colony:
         """Travel actually took this shortcut and it led to `dest` — trust it.
 
         If `dest` differs from what we had recorded, correct it (self-healing when
-        a source was right but the destination was mis-attributed).
+        a source was right but the destination was mis-attributed). Doesn't touch
+        `_step_links` — the source's action kind was already recorded by `report_link`
+        when the link was first discovered, and confirming doesn't change what KIND of
+        object it is, just how much we trust its destination.
         """
         with self._lock:
             if self._links.get(source) != dest:
@@ -922,6 +953,7 @@ class Colony:
         with self._lock:
             self._bad_links.add(source)
             self._links.pop(source, None)
+            self._step_links.discard(source)
             self._save_knowledge()
 
     def get_unconfirmed_crossings(self) -> set[tuple[int, int, int]]:
@@ -931,6 +963,15 @@ class Colony:
         fragments a staircase-dense map)."""
         with self._lock:
             return set(self._unconfirmed_crossings)
+
+    def get_step_links(self) -> set[tuple[int, int, int]]:
+        """A copy of the `_links` sources that are STEP-type (walking onto them IS the
+        trigger). Feed to `nav.find_shared_route`'s `step_links` param so it only
+        auto-teleports a bot for THIS subset — a USE-type link source (not in this set,
+        but still in `get_links()`) is otherwise ordinary walkable ground; using it is a
+        separate, deliberate action (see `client._try_use_object` / `_try_use_underfoot`)."""
+        with self._lock:
+            return set(self._step_links)
 
     def get_hazards(self) -> set[tuple[int, int, int]]:
         """A copy of all known hazard tiles, for a bot to fold into its avoid set."""
@@ -1000,6 +1041,19 @@ class Colony:
                 if source not in self._bad_links:
                     self._links.setdefault(source, dest)
                     self._hazards.add(source)
+                    # Classify the source's action from its item stack (mirrors report_link's
+                    # step/use split) so a warm-seeded USE-type link (a grate) doesn't get
+                    # auto-teleported through by find_shared_route the instant a bot merely
+                    # walks near it — see _step_links / get_step_links. Default to STEP (the
+                    # old, conservative behavior) when we have no item data to classify —
+                    # `tiles` not given, or this exact tile wasn't in the reveal.
+                    items = tiles.get(source) if tiles else None
+                    hit = self.traversal.classify([iid for iid, _c in items]) if items else None
+                    kind = self.traversal.kind(hit[0]) if hit is not None else None
+                    if kind is None or kind.action == "step":
+                        self._step_links.add(source)
+                    else:
+                        self._step_links.discard(source)
             if tiles:
                 for tile, items in tiles.items():
                     if tile in self._links:
@@ -1044,7 +1098,7 @@ class Colony:
         start, goal = tuple(start), tuple(goal)
         costs = self.get_walk_costs()
         route = find_shared_route(self.get_walkable(), self.get_links(), start, goal,
-                           costs=costs)
+                           costs=costs, step_links=self.get_step_links())
         if route is None:
             with self._lock:
                 nlinks = len(self._links)

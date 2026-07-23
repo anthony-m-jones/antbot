@@ -1230,7 +1230,10 @@ async def _walk_local(session: GameSession, item_flags: ItemFlags,
             hazard = (prev[0] + dx, prev[1] + dy, prev[2])   # the tile we stepped onto
             session.state.blocked_tiles.add(hazard)
             if session.colony is not None:
-                session.colony.report_link(hazard, (new.x, new.y, new.z))
+                # An ordinary walk step can only ever accidentally trigger a STEP-type
+                # object (a USE-type one does nothing when merely stepped over) — see
+                # colony._step_links.
+                session.colony.report_link(hazard, (new.x, new.y, new.z), action="step")
                 src_items = session.state.tiles.get(hazard)
                 if src_items:
                     from .traversal import category_from_relocation
@@ -1344,10 +1347,21 @@ async def _follow_shared_route(session: GameSession, item_flags: ItemFlags,
         # Let transient blocks lapse first, so a bot that stepped into our path once
         # doesn't leave a permanent phantom wall in the route planner.
         _prune_blocked_tiles(session)
-        avoid = colony.get_hazards() | set(session.state.blocked_tiles)
+        # report_link files EVERY link source into `_hazards`, step or use alike (see
+        # colony.report_link) — appropriate for a STEP-type source (walking onto it really
+        # would relocate us, exactly what this on-foot-only walker must avoid), but wrong
+        # for a USE-type one (a grate): walking over or near it does nothing, so treating it
+        # as forbidden ground can make a goal that sits exactly on one permanently
+        # unreachable here — this walker has no OTHER way to reach it, since `links={}`
+        # above deliberately excludes the "deliberately use it" option too. Un-avoid the
+        # USE-type sources so they're just ordinary ground to this search (never the
+        # STEP-type ones — those stay genuinely dangerous to blunder into on foot).
+        use_only_links = set(colony.get_links()) - colony.get_step_links()
+        avoid = (colony.get_hazards() - use_only_links) | set(session.state.blocked_tiles)
         route = find_shared_route(colony.get_walkable(), {}, here, goal, reach=reach,
                            avoid=avoid, costs=colony.get_walk_costs(),
-                           unconfirmed_crossings=colony.get_unconfirmed_crossings())
+                           unconfirmed_crossings=colony.get_unconfirmed_crossings(),
+                           step_links=colony.get_step_links())
         session.goal = goal
         session.plan = [landing for _dir, _tp, landing in route] if route else []
         session.plan_source = "shared"   # find_shared_route over the colony map
@@ -1392,7 +1406,7 @@ async def _follow_shared_route(session: GameSession, item_flags: ItemFlags,
             dx, dy = DIRECTION_DELTAS[direction]
             hazard = (prev[0] + dx, prev[1] + dy, prev[2])
             session.state.blocked_tiles.add(hazard)
-            colony.report_link(hazard, (new.x, new.y, new.z))
+            colony.report_link(hazard, (new.x, new.y, new.z), action="step")  # see _autowalk_run
             if new.z != prev[2]:
                 return False   # we're off our floor; the caller re-plans globally
             continue
@@ -1812,9 +1826,72 @@ async def _try_use_object(session: GameSession, item_flags: ItemFlags,
     tried[source] = now + _TRIED_TTL    # attempted — hold off, but retry after the TTL
     landing = await _reach_and_use(session, item_flags, found)
     if landing is not None:
-        colony.report_link(source, (landing.x, landing.y, landing.z))
+        # find_use_object only ever returns USE-based objects (it explicitly skips STEP
+        # ones — see there), so this is always a deliberate use.
+        colony.report_link(source, (landing.x, landing.y, landing.z), action="use")
         session.log_event("info", "traversal",
                           f"used {category} at {source} -> "
+                          f"({landing.x},{landing.y},{landing.z}); recorded shortcut")
+    return True
+
+
+async def _try_use_underfoot(session: GameSession, item_flags: ItemFlags,
+                             tried: dict, direction: str) -> bool:
+    """Are we standing exactly on a USE-type floor-change (a ladder/grate) that goes
+    `direction`? If so, use it directly — the fix for a real gap `_try_change_floor` can't
+    close on its own.
+
+    `_try_change_floor`'s own "standing on it" fallback (see there) only re-triggers a
+    STEP-type object: stepping off and back onto it works BECAUSE a STEP object fires on
+    the walk itself. A USE-type object is the opposite — walking over it does nothing, so
+    the ONLY way to trigger one we're already standing on is a deliberate `_perform_traversal`
+    "use", exactly as if we'd just walked up and used it on purpose. `find_descent`
+    deliberately skips distance-0 candidates for the same reason `_try_change_floor` handles
+    "standing on it" as a separate case rather than folding it into the hunt: an object we're
+    ON has no adjacent launch tile to path to.
+
+    `tried` is the SAME cooldown dict floor-change hunting already uses (tile -> retry time),
+    so a `use` that doesn't relocate us (a locked door needing a key we don't carry) isn't
+    hammered every round. Returns True if we attempted something here, False if there was
+    nothing to try (plain ground, a STEP object, the wrong direction, or on cooldown).
+    """
+    from .nav import is_walkable
+
+    colony = session.colony
+    if colony is None:
+        return False
+    pos = session.state.position
+    if pos is None:
+        return False
+    now = time.monotonic()
+    here_tile = (pos.x, pos.y, pos.z)
+    if here_tile in _live_tried(tried, now):
+        return False
+    items = session.state.tiles.get(here_tile)
+    if not items:
+        return False
+    hit = colony.traversal.classify(tile_ids(items))
+    if hit is None:
+        return False
+    category, item_id = hit
+    kind = colony.traversal.kind(category)
+    if kind is None or kind.action == "step" or kind.direction != direction:
+        return False
+    # _perform_traversal wants a CARDINAL direction (it uses one for USE's "grate that's
+    # secretly a step" fallback, which raw-steps us). We're not launching FROM anywhere —
+    # we're already on the object — so any walkable neighbour is a reasonable placeholder
+    # for that rare fallback; it's a graceful no-op if it fires and picks wrong (next round
+    # just retries).
+    cardinal = next((name for name, (dx, dy) in DIRECTION_DELTAS.items()
+                     if is_walkable(session.state, item_flags,
+                                    pos.x + dx, pos.y + dy, pos.z)), "north")
+    tried[here_tile] = now + _TRIED_TTL
+    landing = await _perform_traversal(session, here_tile, cardinal, category, item_id)
+    if landing is not None and landing.z != pos.z:
+        # Gated above on kind.action != "step", so this is always a deliberate use.
+        colony.report_link(here_tile, (landing.x, landing.y, landing.z), action="use")
+        session.log_event("info", "traversal",
+                          f"used {category} at {here_tile} (standing on it) -> "
                           f"({landing.x},{landing.y},{landing.z}); recorded shortcut")
     return True
 
@@ -1866,7 +1943,11 @@ async def _try_change_floor(session: GameSession, item_flags: ItemFlags,
         session.status = f"{verb} ({category})"
         landing = await _perform_traversal(session, source, direction, category, item_id)
         if landing is not None and landing.z != pos.z:
-            colony.report_link(source, (landing.x, landing.y, landing.z))
+            # find_descent returns EITHER action (a STEP-down hole or a USE-down grate can
+            # both match `direction` — see there), so check which this one actually was.
+            found_kind = colony.traversal.kind(category)
+            found_action = "step" if found_kind is not None and found_kind.action == "step" else "use"
+            colony.report_link(source, (landing.x, landing.y, landing.z), action=found_action)
             session.log_event("info", "traversal",
                               f"{verb} via {category} at {source} -> "
                               f"({landing.x},{landing.y},{landing.z}); recorded shortcut")
@@ -1898,8 +1979,10 @@ async def _try_change_floor(session: GameSession, item_flags: ItemFlags,
                 await _raw_step(session, reverse)             # back onto it -> triggers
                 landing = session.state.position
                 if landing is not None and landing.z != pos.z:
+                    # Gated above on kind.action == "step" (only a STEP object re-triggers
+                    # from stepping off and back on).
                     colony.report_link((pos.x, pos.y, pos.z),
-                                       (landing.x, landing.y, landing.z))
+                                       (landing.x, landing.y, landing.z), action="step")
                     session.log_event("info", "traversal",
                                       f"{verb} off/on at {(pos.x, pos.y, pos.z)} -> "
                                       f"({landing.x},{landing.y},{landing.z})")
@@ -1927,7 +2010,7 @@ async def travel(session: GameSession, item_flags: ItemFlags,
     `reach` accepts arrival within that many tiles — for walking up to an OBJECT
     (a locker, a pile under a blocking item) rather than onto a tile.
     """
-    from .nav import find_shared_route, within_reach
+    from .nav import find_shared_route, within_reach, is_walkable
 
     colony = session.colony
     if colony is None:
@@ -1957,7 +2040,8 @@ async def travel(session: GameSession, item_flags: ItemFlags,
         route = find_shared_route(colony.get_walkable(), links, here, goal,
                            reach=reach, avoid=colony.get_hazards() - set(links),
                            costs=colony.get_walk_costs(),
-                           unconfirmed_crossings=colony.get_unconfirmed_crossings())
+                           unconfirmed_crossings=colony.get_unconfirmed_crossings(),
+                           step_links=colony.get_step_links())
         if route is None:
             # Nothing in the shared map connects us — normal when the goal is somewhere
             # nobody has been, or when we're standing in a not-yet-connected pocket.
@@ -2021,10 +2105,23 @@ async def travel(session: GameSession, item_flags: ItemFlags,
 
         # Deliberately traverse the shortcut tile. `_take_shortcut` USES it if it's a
         # ladder/grate/door and steps onto it if it's a teleporter/stairs/open hole.
-        source = (launch[0] + DIRECTION_DELTAS[direction][0],
-                  launch[1] + DIRECTION_DELTAS[direction][1], launch[2])
+        if direction == "__here__":
+            # find_shared_route's sentinel (see its docstring): `launch` IS the link's
+            # source tile — we started standing on it, so there's no adjacency to walk.
+            # _take_shortcut/_perform_traversal only consult `direction` as a cardinal for
+            # a USE object's rare "secretly a STEP" fallback, so any walkable neighbour is
+            # a fine placeholder (same trick as `_try_use_underfoot`).
+            source = launch
+            cardinal = next((name for name, (dx, dy) in DIRECTION_DELTAS.items()
+                             if is_walkable(session.state, item_flags,
+                                            source[0] + dx, source[1] + dy, source[2])),
+                            "north")
+        else:
+            source = (launch[0] + DIRECTION_DELTAS[direction][0],
+                      launch[1] + DIRECTION_DELTAS[direction][1], launch[2])
+            cardinal = direction
         log.info("travel: taking shortcut %s -> %s (via %s)", source, landing, direction)
-        await _take_shortcut(session, source, direction)
+        await _take_shortcut(session, source, cardinal)
         after = session.state.position
         if after is None:
             return False
@@ -2543,6 +2640,13 @@ async def navigate_to(session: GameSession, item_flags: ItemFlags,
     (scout) that's happy to be relocated by ANY exit it stumbles on while trying to
     make progress — that's exploration, not a wrong turn.
 
+    WRONG FLOOR, STANDING ON A USE-OBJECT. `_try_change_floor` hunts nearby floor-changes
+    and re-triggers a STEP-type one we're already standing on (a step fires on the walk
+    itself), but a USE-type one (a grate is the case that surfaced this) does nothing when
+    merely stood on — the only way to fire it is a deliberate use. If a destination sits
+    exactly on a grate/ladder, `_try_change_floor` alone leaves us parked there forever;
+    `_try_use_underfoot` is the fallback that notices and uses it directly.
+
     BLOCKED/DETOURED BY A CREATURE. A door or a wrong floor aren't the only things that
     can stand between here and there — a monster (or another bot/player) parked in a
     single-tile corridor does too, and unlike terrain, an occupied tile is never durably
@@ -2609,13 +2713,24 @@ async def navigate_to(session: GameSession, item_flags: ItemFlags,
         before = (pos.x, pos.y, pos.z)
 
         if pos.z != z:
-            # Wrong floor — the shared router couldn't get us there, so hunt a floor-change
-            # in the target's direction and take it (z is SMALLER higher up in Tibia). This
-            # is the scout's own floor-change hunt: a hole/down-stair we step onto or a
-            # grate we use for DOWN, an up-staircase for UP.
-            await _try_change_floor(session, item_flags, floor_tried,
-                               max_dist=_DESCENT_RADIUS,
-                               direction="up" if z < pos.z else "down")
+            # Wrong floor. Check STANDING ON IT before hunting: _try_change_floor's hunt
+            # (find_descent, up to _DESCENT_RADIUS=30 tiles) will happily walk us toward
+            # some OTHER, farther floor-change the instant it finds one — it has no way to
+            # know "you're already standing on the answer" until its hunt comes up empty,
+            # and a 30-tile radius in a stair-dense building almost always finds SOMETHING.
+            # So if we don't check the current tile FIRST, a destination that sits exactly
+            # on a floor-change (a grate is the case that exposed this) never gets used:
+            # the hunt keeps finding and chasing a decoy instead, every single round.
+            # _try_use_underfoot only ever fires for a USE-type match (ladders/grates) —
+            # STEP-type "standing on it" stays _try_change_floor's own job (stepping off
+            # and back on, which is what actually retriggers a STEP object).
+            floor_direction = "up" if z < pos.z else "down"
+            used_underfoot = await _try_use_underfoot(session, item_flags, floor_tried,
+                                                       floor_direction)
+            if not used_underfoot:
+                await _try_change_floor(session, item_flags, floor_tried,
+                                   max_dist=_DESCENT_RADIUS,
+                                   direction=floor_direction)
         else:
             # Right floor — walk toward the target. If that gets us nowhere, an obstacle
             # (a closed door, or — for a caller that allows it — any known exit) may block
