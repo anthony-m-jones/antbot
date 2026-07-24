@@ -373,6 +373,20 @@ carpet-NPC legs once those exist (#5 above).
       haven't been exercised with actual items.
 - [ ] **Keys**: recognise key items, map which key opens which door (action/key
       id), acquire + carry + use.
+- [ ] **Locked doors are pruned FOREVER, with no way back (2026-07-23).** In `travel`'s
+      shortcut handling, a door that rejects the on-foot step through it (still locked,
+      no key) falls into the exact same `colony.mark_bad_link` path as a link whose
+      recorded destination was simply wrong — permanently blacklisted in `_bad_links`,
+      never reconsidered ([client.py](antbot/antbot/client.py) `travel`, around the
+      self-heal/prune fallthrough after `_take_shortcut`). That's the right call for a
+      genuinely bogus link, but wrong for a door that's only locked *right now* — once
+      the "Keys" item above exists (or a quest/GM unlocks it), the door should become
+      usable again, and today it can't: `_bad_links` has no expiry and no distinction
+      between "this was never real" and "this is real but currently locked." Kept as
+      permanent for now (deliberate, see the Gap 1/Gap 2 travel-executor redesign
+      discussion) — revisit once key-learning lands: write a test where a bot meets a
+      locked door it has no key for, later acquires the right key, and confirms it can
+      route back through the same door instead of treating it as dead forever.
 
 ## Traversal — teleport precision (improvements)
 

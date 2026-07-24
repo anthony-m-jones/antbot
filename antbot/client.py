@@ -1294,9 +1294,43 @@ def _path_tiles(start, directions: list[str]) -> list[tuple[int, int, int]]:
 
 
 @log_call
+async def _cross_door(session: GameSession, item_flags: ItemFlags,
+                      door: tuple[int, int, int], direction: str) -> bool:
+    """We're adjacent to a tile the colony knows as a door; open it if our freshest
+    local view says it's currently shut, then step onto/through it.
+
+    The shared map only ever records THAT a tile is a door (`contribute_tiles`'s
+    door_unlocked self-link seeding) — never whether it's open or closed right now,
+    since that changes moment to moment and a tile is only ever classified once
+    (never re-checked after `_explored` claims it). So this asks `state.tiles` — this
+    bot's own view, freshest right where we're standing — instead of trusting that
+    stale shared belief either way.
+
+    Skipping the `use_item` when it's ALREADY open isn't just an optimization: using
+    an open door a second time TOGGLES it shut in Tibia, so blindly using it on every
+    crossing (the way `_take_shortcut` does for a genuine, always-use-it shortcut)
+    would have us slamming doors on ourselves. Doors are the one link kind where
+    "is it actually closed right now" has to be checked, not assumed.
+
+    Returns True if we ended up past it (whether or not opening was needed), False if
+    the step still failed afterward (locked, or something else occupying it).
+    """
+    from .nav import is_walkable
+    colony = session.colony
+    if colony is not None and not is_walkable(session.state, item_flags, *door):
+        items = session.state.tiles.get(door)
+        if items:
+            hit = colony.traversal.classify(tile_ids(items))
+            if hit is not None and hit[0] in _DOOR_CATEGORIES:
+                await _perform_traversal(session, door, direction, hit[0], hit[1])
+    return await _raw_step(session, direction)
+
+
+@log_call
 async def _follow_shared_route(session: GameSession, item_flags: ItemFlags,
                                goal_x: int, goal_y: int, goal_z: int, reach: int = 0,
-                               max_steps: int = 400) -> bool:
+                               max_steps: int = 400,
+                               seed_route: list | None = None) -> bool:
     """Walk to (or within `reach` of) a goal by following a route planned over the
     COLONY's shared explored map. Returns True if we arrived.
 
@@ -1325,6 +1359,42 @@ async def _follow_shared_route(session: GameSession, item_flags: ItemFlags,
     `avoid`, so the shared map — which only ever grows and never marks a tile bad —
     can't keep routing us into the same wall.
 
+    The route is a PLAN, not a query we repeat out of habit: we compute it once with
+    `find_shared_route` (a Dijkstra over the whole shared map — not free) and then just
+    walk successive `_AUTOWALK_CHUNK` slices of that same route, chunk after chunk,
+    with no re-planning in between. `_autowalk_run` tells us exactly when the cached
+    plan stops being trustworthy — "done" means we landed EXACTLY where the chunk
+    predicted, so the remaining cached steps are still valid and we simply advance our
+    index into them; anything else (glitch/silent/rejected/hazard) means we ended up
+    somewhere the plan didn't expect, so the directions after it no longer point where
+    we think — THAT is when we throw the route away and pay for a fresh Dijkstra from
+    wherever we actually are. A clean multi-hundred-tile walk now costs one plan instead
+    of one every ~24 steps.
+
+    `seed_route` lets a caller that already ran an equivalent `find_shared_route` hand
+    us its answer instead of making us solve the identical problem again. `travel` is
+    the one caller in this position: it plans WITH links (to look for a shortcut hop),
+    and when it finds none, the route it just computed IS this walker's route too —
+    same start, same goal, and provably no link tile anywhere on it (a link crossing
+    always shows up as `is_teleport=True`, so "no shortcut found" means the search
+    never touched one). We only spend it once, on the very first iteration; every
+    replan after that (something drifted, so the cached plan's directions no longer
+    apply) goes back to computing our own, since by then `blocked_tiles` may have
+    grown in ways `travel`'s search never saw.
+
+    A DOOR along the route is handled inline, not by `travel` — unlike every other
+    link kind, using one never relocates you (see `contribute_tiles`'s door_unlocked
+    self-link seeding: source -> itself), so there's no frame-of-reference shift that
+    would demand travel's stop/hop/re-plan machinery. Before each chunk we scan the
+    upcoming stretch of the CACHED route (bounded to `_AUTOWALK_CHUNK`, using the
+    colony's link table — global knowledge, so this works exactly as well 24 tiles
+    into territory we've never personally seen as it does one step away) for the
+    first tile recorded as a door. If one turns up, the chunk is cut short right
+    before it, and `_cross_door` opens it (only if our freshest local view says it's
+    actually shut right now — see there) and steps through, WITHOUT discarding the
+    rest of the cached route. Only a door that won't open at all (locked, or
+    something's occupying it) forces a real replan.
+
     Scouts still want `_walk_local`: heading into UNEXPLORED space is exactly what the
     shared map can't help with, and greedy-toward-the-goal is the right instinct there.
     So this returns False when there's no colony or no known route, and callers fall
@@ -1338,6 +1408,8 @@ async def _follow_shared_route(session: GameSession, item_flags: ItemFlags,
 
     goal = (goal_x, goal_y, goal_z)
     steps = 0
+    route = None            # the cached plan: list of (direction, is_teleport, landing)
+    idx = 0                 # how far into `route` we've already walked
     while steps < max_steps:
         pos = session.state.position
         if pos is None or session.closed.is_set() or session.stop_event.is_set():
@@ -1346,10 +1418,6 @@ async def _follow_shared_route(session: GameSession, item_flags: ItemFlags,
         if within_reach(here, goal, reach):
             return True
 
-        # Links are deliberately EXCLUDED: this is the on-foot leg walker. `travel`
-        # owns shortcut traversal, because stepping onto a teleport needs a raw step
-        # and a re-plan afterwards. Passing links here would produce a route whose
-        # directions we'd then walk straight into a stairwell.
         # Hit back while we walk — same reason as in `_walk_local`: this loop is where the
         # time goes, so self-defence has to live here too, not only in the scout round.
         await _engage_adjacent(session)
@@ -1357,33 +1425,93 @@ async def _follow_shared_route(session: GameSession, item_flags: ItemFlags,
         # Let transient blocks lapse first, so a bot that stepped into our path once
         # doesn't leave a permanent phantom wall in the route planner.
         _prune_blocked_tiles(session)
-        # get_avoid_hazards() (not get_hazards()) excludes a USE-type link source (a
-        # grate): walking over or near one does nothing, so treating it as forbidden
-        # ground can make a goal that sits exactly on one permanently unreachable here —
-        # this walker has no OTHER way to reach it, since `links={}` above deliberately
-        # excludes the "deliberately use it" option too. STEP-type sources stay avoided
-        # (genuinely dangerous to blunder into on foot) — see colony.get_avoid_hazards().
-        avoid = colony.get_avoid_hazards() | set(session.state.blocked_tiles)
-        route = find_shared_route(colony.get_walkable(), {}, here, goal, reach=reach,
-                           avoid=avoid, costs=colony.get_walk_costs(),
-                           unconfirmed_crossings=colony.get_unconfirmed_crossings(),
-                           step_links=colony.get_step_links())
-        session.goal = goal
-        session.plan = [landing for _dir, _tp, landing in route] if route else []
-        session.plan_source = "shared"   # find_shared_route over the colony map
-        if not route:
-            # Either we're there (handled above) or the shared map doesn't connect us.
-            session._report_to_colony()
-            return False
 
-        chunk = [direction for direction, _tp, _land in route][:_AUTOWALK_CHUNK]
+        if route is None or idx >= len(route):
+            if seed_route is not None:
+                # `travel` already solved this one (see the docstring) — spend it
+                # instead of re-running an identical Dijkstra. One-time use: clear it
+                # so every later replan in this call computes its own, current route.
+                route = seed_route
+                seed_route = None
+            else:
+                # Links are deliberately EXCLUDED: this is the on-foot leg walker. `travel`
+                # owns shortcut traversal, because stepping onto a teleport needs a raw step
+                # and a re-plan afterwards. Passing links here would produce a route whose
+                # directions we'd then walk straight into a stairwell.
+                # get_avoid_hazards() (not get_hazards()) excludes a USE-type link source (a
+                # grate): walking over or near one does nothing, so treating it as forbidden
+                # ground can make a goal that sits exactly on one permanently unreachable here —
+                # this walker has no OTHER way to reach it, since `links={}` here deliberately
+                # excludes the "deliberately use it" option too. STEP-type sources stay avoided
+                # (genuinely dangerous to blunder into on foot) — see colony.get_avoid_hazards().
+                avoid = colony.get_avoid_hazards() | set(session.state.blocked_tiles)
+                route = find_shared_route(colony.get_walkable(), {}, here, goal, reach=reach,
+                                   avoid=avoid, costs=colony.get_walk_costs(),
+                                   unconfirmed_crossings=colony.get_unconfirmed_crossings(),
+                                   step_links=colony.get_step_links())
+            idx = 0
+            session.goal = goal
+            session.plan_source = "shared"   # find_shared_route over the colony map
+            if not route:
+                # Either we're there (handled above) or the shared map doesn't connect us.
+                session.plan = []
+                session._report_to_colony()
+                return False
+
+        session.plan = [landing for _dir, _tp, landing in route[idx:]]
+
+        # Look ahead (bounded, cheap — dict lookups against the colony's link table,
+        # not a live-sight check) for the first door in the stretch we're about to
+        # walk. A door is a SELF-link: `links[tile] == tile` is what tells one apart
+        # from an ordinary relocating link (stairs/hole/teleporter), which we must
+        # NOT try to inline-cross here — that needs travel's stop/hop/re-plan dance.
+        links = colony.get_links()
+        door_at = next((k for k, (_dir, _tp, landing) in
+                        enumerate(route[idx:idx + _AUTOWALK_CHUNK])
+                        if links.get(landing) == landing), None)
+
+        if door_at == 0:
+            direction, _tp, door_tile = route[idx]
+            if await _cross_door(session, item_flags, door_tile, direction):
+                idx += 1
+                steps += 1
+                continue
+            # Didn't open/cross. Same reasoning as an ordinary rejected step below:
+            # only blame the DOOR (permanently prune it) if nothing alive explains
+            # the failure — a creature standing on it is transient, not a lock.
+            occupied = any(
+                c.position is not None
+                and (c.position.x, c.position.y, c.position.z) == door_tile
+                for c in session.state.nearby_creatures())
+            if not occupied:
+                colony.mark_bad_link(door_tile)
+                session.log_event("warning", "door",
+                                  f"door at {door_tile} wouldn't open or cross; pruned")
+            session.state.blocked_tiles.add(door_tile)
+            session.state.blocked_expiry[door_tile] = time.monotonic() + _BLOCK_TTL
+            route = None
+            await asyncio.sleep(0.1)
+            continue
+
+        end = idx + door_at if door_at is not None else idx + _AUTOWALK_CHUNK
+        chunk = [direction for direction, _tp, _land in route[idx:end]]
         outcome = await _autowalk_run(session, chunk, pos)
         kind, done = outcome[0], outcome[1]
         steps += max(1, done)
 
         if kind == "closed":
             return False
-        if kind in ("done", "glitch"):
+        if kind == "done":
+            # Landed exactly where the cached plan predicted — the rest of `route` is
+            # still trustworthy, so just advance through it. No replan.
+            idx += done
+            continue
+
+        # Every other outcome means we're no longer where the cached plan assumed, so
+        # its remaining directions would walk us somewhere wrong. Drop it; the top of
+        # the loop will pay for one fresh Dijkstra from our real position.
+        route = None
+        if kind == "glitch":
             continue
         if kind == "silent":
             dead = outcome[2]
@@ -2020,13 +2148,16 @@ async def travel(session: GameSession, item_flags: ItemFlags,
 
     Plans a route with `find_shared_route` over the colony's shared walkable map + learned
     links (stairs/holes/teleports), then executes it hop by hop:
-      - on-foot stretches are walked with `_follow_shared_route`, which FOLLOWS the shared
-        route (falling back to `_walk_local`'s local feel-your-way only when the shared
-        map can't connect us — e.g. the last stretch into somewhere nobody's been),
-      - a shortcut hop is traversed by stepping onto the source tile, which the
-        normal walker avoids — so we do it with a raw step and confirm we landed
-        where the link said.
-    We re-plan after every shortcut because teleporting shifts our whole frame of
+      - on-foot stretches — INCLUDING any door along the way, which `_follow_shared_route`
+        opens inline since using one never relocates you — are walked with
+        `_follow_shared_route` (falling back to `_walk_local`'s local feel-your-way only
+        when the shared map can't connect us — e.g. the last stretch into somewhere
+        nobody's been),
+      - a RELOCATING shortcut hop (stairs/hole/teleporter/ladder/grate — anything that
+        actually moves you, unlike a door) is traversed by stepping onto the source
+        tile, which the normal walker avoids — so we do it with a raw step and confirm
+        we landed where the link said.
+    We re-plan after every such shortcut because teleporting shifts our whole frame of
     reference. Returns True on arrival. (NPC/boat travel will add another hop type
     here once the conversation protocol exists.)
 
@@ -2086,16 +2217,25 @@ async def travel(session: GameSession, item_flags: ItemFlags,
                 return False
             continue
 
-        # Find the first shortcut hop; walk on foot up to the tile it starts from,
-        # then take it. If there's no shortcut, the whole route is on-foot.
-        first_teleport = next((i for i, step in enumerate(route) if step[1]), None)
+        # Find the first RELOCATING shortcut hop; walk on foot up to the tile it starts
+        # from, then take it. A door crossing also shows up with is_teleport=True (see
+        # find_shared_route's docstring — USE-type links get a "use it" edge), but
+        # `links[door] == door` (contribute_tiles' self-link seeding: using one never
+        # relocates you) is exactly what tells it apart from a real one — so it's
+        # filtered out here and left for `_follow_shared_route` to open inline as it
+        # walks past. If there's no REAL shortcut left, the whole route is on-foot.
+        first_teleport = next((i for i, step in enumerate(route)
+                               if step[1] and links.get(step[2]) != step[2]), None)
 
         if first_teleport is None:
             # Pure on-foot route (same floor / same region). Follow the route we just
             # planned over the shared map — NOT `_walk_local`, which would discard it and
             # re-guess from this bot's private, ~8-tile view (see `_follow_shared_route`).
+            # `route` IS `_follow_shared_route`'s own answer too (no shortcut on it, same
+            # start/goal) — hand it over as `seed_route` instead of making it re-plan the
+            # identical thing on its first step.
             if await _follow_shared_route(session, item_flags, goal_x, goal_y, goal_z,
-                                  reach=reach):
+                                  reach=reach, seed_route=route):
                 continue
             # The shared route ran out (unexplored last stretch, or we got pushed off
             # it). Feel the rest of the way locally, then re-plan: what we just walked
@@ -2117,9 +2257,11 @@ async def travel(session: GameSession, item_flags: ItemFlags,
 
         if here != launch:
             # Walk on foot to the launch tile (same floor as us), following the shared
-            # route; fall back to local navigation only if that can't do it.
+            # route; fall back to local navigation only if that can't do it. The on-foot
+            # PREFIX of `route` (everything before the shortcut) already IS this leg —
+            # seed it rather than re-planning the same steps.
             if not await _follow_shared_route(session, item_flags, launch[0], launch[1],
-                                      launch[2]):
+                                      launch[2], seed_route=route[:first_teleport]):
                 await _walk_local(session, item_flags, launch[0], launch[1])
             p = session.state.position
             if p is None or (p.x, p.y, p.z) != launch:
@@ -2127,7 +2269,8 @@ async def travel(session: GameSession, item_flags: ItemFlags,
                 return False
 
         # Deliberately traverse the shortcut tile. `_take_shortcut` USES it if it's a
-        # ladder/grate/door and steps onto it if it's a teleporter/stairs/open hole.
+        # ladder/grate and steps onto it if it's a teleporter/stairs/open hole — never
+        # a door, which `first_teleport` above already filtered out.
         if direction == "__here__":
             # find_shared_route's sentinel (see its docstring): `launch` IS the link's
             # source tile — we started standing on it, so there's no adjacency to walk.
@@ -2149,27 +2292,6 @@ async def travel(session: GameSession, item_flags: ItemFlags,
         if after is None:
             return False
         after_t = (after.x, after.y, after.z)
-
-        if source == landing and direction != "__here__":
-            # An UNBLOCK-type link (a door): `source == landing` is exactly how a door's
-            # self-link is recorded (see colony.contribute_tiles), because using it never
-            # relocates anyone the way every other link kind does — so right after
-            # `_take_shortcut`, `after_t` is still just `launch`, one tile short of the
-            # door. Take the on-foot step onto/through it now that `_perform_traversal`
-            # has (optimistically) cleared it locally — otherwise every replan would just
-            # re-open the same already-open door forever, never actually advancing past
-            # it (there's no OTHER route past it: crossing a door is a two-part act, use
-            # it, THEN step, not one atomic hop like a teleport). A door that's actually
-            # still shut (locked, no key) simply rejects this step, and `after_t` below
-            # then falls through to the same self-heal/prune handling as any other
-            # stalled shortcut. (`__here__` is excluded: it means we started standing
-            # exactly ON the door tile, so `after_t` already equals `landing` — nothing
-            # left to walk onto.)
-            await _raw_step(session, cardinal)
-            after = session.state.position
-            if after is None:
-                return False
-            after_t = (after.x, after.y, after.z)
 
         if after_t == landing:
             colony.confirm_link(source, landing)          # trusted from now on

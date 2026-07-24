@@ -81,7 +81,10 @@ class TileRequire:
 class TileSetup:
     """A setup action applied via GOD before the run: put the tile item at (x, y, z) into
     `to_id`, transforming `from_id` if it's currently that (idempotent — see /settile).
-    This is how a door is reset to a known state WITHOUT a server restart."""
+    This is how a door is reset to a known state WITHOUT a server restart.
+
+    `_drive` always applies every `setup` entry BEFORE the `/tpto` that follows it — see
+    the comment there for why the order is load-bearing, not cosmetic."""
     x: int
     y: int
     z: int
@@ -341,9 +344,23 @@ async def _drive(colony: Colony, flags: ItemFlags, test: NavTest) -> Result:
         # are already at the start via DB teleport and reset via the map reload.)
         established: set[tuple[int, int, int, int]] = set()  # (x,y,z,id) GOD confirmed
         if not test.reset_map:
-            cmds = [f"/tpto {CHARACTER}, {sx}, {sy}, {sz}"]
-            cmds += [f"/settile {s.x}, {s.y}, {s.z}, {s.from_id}, {s.to_id}"
-                     for s in test.setup]
+            # /settile MUST run before /tpto, not after. A teleport delivers a full,
+            # authoritative map re-describe (Canary sends a 0x64 map-description packet
+            # centred on the destination — see world.py's OP_MAP_DESCRIPTION handling),
+            # which is how the bot's OWN parsed `state.tiles` gets refreshed for the area.
+            # If /settile ran SECOND, that snapshot could be generated from the OLD tile
+            # state (a door mid-toggle) — and since `contribute_tiles` only ever classifies
+            # a tile ONCE (it skips anything already in `_explored`), a stale glimpse from
+            # that one race gets baked into the shared colony map PERMANENTLY, with no way
+            # to self-correct later. gm_run() sends commands strictly in order, waiting a
+            # real settle delay after each (see gm.py), so putting /settile first guarantees
+            # the server has already committed the reset before the teleport — and the map
+            # snapshot it triggers — fires. (Found via "Bot can open a door to leave a
+            # room": the door's shared-map belief didn't match what `requires` had just
+            # verified live, traced back to exactly this ordering.)
+            cmds = [f"/settile {s.x}, {s.y}, {s.z}, {s.from_id}, {s.to_id}"
+                    for s in test.setup]
+            cmds.append(f"/tpto {CHARACTER}, {sx}, {sy}, {sz}")
             replies = await gm.gm_run(flags, *cmds)
             if not any("tpto:" in r for r in replies):
                 outcome["result"] = Result(
